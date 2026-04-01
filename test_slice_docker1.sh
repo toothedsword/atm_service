@@ -1,0 +1,12 @@
+curl -X POST http://172.17.0.3:5001/api/slice \
+  -F "data_t=@/home/leon/Downloads/atm_service/tdata.txt" \
+  -F "data_rh=@/home/leon/Downloads/atm_service/rhdata.txt" \
+  -F "data_u=@/home/leon/Downloads/atm_service/udata.txt" \
+  -F "data_v=@/home/leon/Downloads/atm_service/vdata.txt" \
+  -F 'lons=[115.5,115.8,116.0,116.3,116.8]' \
+  -F 'lats=[40.0,40.3,40.5,40.7,41.0]' \
+  -F 'flight_height=1' \
+  -F 'nx_points=200' \
+  -F 'label=griddata' \
+  -F 'plot_types=["-t-r-uv-"]' \
+  -o slice_plot.png
