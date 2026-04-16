@@ -960,22 +960,32 @@ def openmeteo_point():
 
 def _ppi_common(worker_script, zip_name):
     """
-    公共逻辑：解析请求体中的 files 列表，调用指定 worker，
+    公共逻辑：接收上传的 CSV 文件（multipart），按文件名排序后调用 worker，
     读取 result.json 判断是否跳过，否则打包 PNG+TIF 返回 ZIP。
     """
     task_id     = str(uuid.uuid4())
     work_dir    = os.path.join(TEMP_BASE, task_id)
+    upload_dir  = os.path.join(TEMP_BASE, f'{task_id}_upload')
     config_file = os.path.join(TEMP_BASE, f'{task_id}_config.json')
     zip_path    = os.path.join(TEMP_BASE, f'{task_id}_result.zip')
 
     try:
-        body = request.get_json(force=True, silent=True)
-        if not body or 'files' not in body:
-            return jsonify({"error": "请求体须为 JSON，包含 files 字段（文件路径列表）"}), 400
+        uploaded = request.files.getlist('files')
+        if not uploaded:
+            return jsonify({"error": "请通过 multipart 上传 CSV 文件，字段名为 files"}), 400
 
-        files = body['files']
-        if not isinstance(files, list) or len(files) == 0:
-            return jsonify({"error": "files 须为非空列表"}), 400
+        os.makedirs(work_dir,   exist_ok=True)
+        os.makedirs(upload_dir, exist_ok=True)
+
+        # 保存上传文件，按原始文件名排序以保证时间顺序
+        saved = []
+        for f in uploaded:
+            fname = secure_filename(f.filename) if f.filename else f'{uuid.uuid4()}.csv'
+            dest  = os.path.join(upload_dir, fname)
+            f.save(dest)
+            saved.append((fname, dest))
+        saved.sort(key=lambda x: x[0])          # 按文件名排序（含时间戳，如 0912/0913）
+        files = [dest for _, dest in saved]
 
         os.makedirs(work_dir, exist_ok=True)
         with open(config_file, 'w', encoding='utf-8') as f:
@@ -1014,7 +1024,7 @@ def _ppi_common(worker_script, zip_name):
         logger.error(f"{worker_script} 失败: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
-        cleanup_later(config_file, zip_path, work_dir)
+        cleanup_later(config_file, zip_path, work_dir, upload_dir)
 
 
 @app.route('/api/ppi_latest', methods=['POST'])
