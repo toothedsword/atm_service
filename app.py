@@ -173,6 +173,96 @@ def ppi_latest():
         threading.Thread(target=_cleanup, daemon=True).start()
 
 
+@app.route('/api/ppi_vad_latest', methods=['POST'])
+def ppi_vad_latest():
+    """
+    在 /api/ppi_latest 基础上，额外用 VAD 方法反演水平风场。
+
+    请求体（JSON）与 /api/ppi_latest 完全相同:
+    {
+        "files": ["/path/to/0912.csv", "/path/to/0913.csv", "/path/to/0914.csv"]
+    }
+
+    返回：ZIP 文件，包含：
+      ppi_*.png          径向风速专题图
+      ppi_*.tif          径向风速 GeoTIFF
+      wind_speed_*.tif   VAD 反演风速 GeoTIFF
+      wind_uv_*.png      VAD 反演风速填色 + 风矢量 PNG
+    跳过时返回 JSON {"skipped": true, ...}。
+    """
+    task_id     = str(uuid.uuid4())
+    work_dir    = os.path.join(TEMP_DIR, task_id)
+    config_file = os.path.join(TEMP_DIR, f'{task_id}_config.json')
+    zip_path    = os.path.join(TEMP_DIR, f'{task_id}_result.zip')
+
+    try:
+        body = request.get_json(force=True, silent=True)
+        if not body or 'files' not in body:
+            return jsonify({"error": "请求体须为 JSON，包含 files 字段（文件路径列表）"}), 400
+
+        files = body['files']
+        if not isinstance(files, list) or len(files) == 0:
+            return jsonify({"error": "files 须为非空列表"}), 400
+
+        os.makedirs(work_dir, exist_ok=True)
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump({"files": files}, f, ensure_ascii=False)
+
+        cmd = f'python3 ppi_vad_worker.py {config_file} {work_dir}'
+        ret = os.system(cmd)
+        if ret != 0:
+            return jsonify({"error": f"ppi_vad_worker 返回错误码 {ret}"}), 500
+
+        result_json = os.path.join(work_dir, 'result.json')
+        if not os.path.exists(result_json):
+            return jsonify({"error": "worker 未写出 result.json"}), 500
+        with open(result_json, encoding='utf-8') as rf:
+            worker_result = json.load(rf)
+
+        if 'error' in worker_result:
+            return jsonify(worker_result), 500
+        if worker_result.get('skipped'):
+            return jsonify(worker_result), 200
+
+        out_files = [os.path.join(work_dir, fn) for fn in os.listdir(work_dir)
+                     if fn.endswith('.png') or fn.endswith('.tif')]
+        if not out_files:
+            return jsonify({"error": "worker 未生成任何输出文件"}), 500
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fp in out_files:
+                zf.write(fp, os.path.basename(fp))
+
+        return send_file(
+            zip_path,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='ppi_vad_latest.zip',
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    finally:
+        def _cleanup():
+            time.sleep(5)
+            for p in [config_file, zip_path]:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            try:
+                import shutil
+                if os.path.exists(work_dir):
+                    shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查接口"""

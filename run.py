@@ -201,9 +201,12 @@ def get_service_info():
             "/api/ec-timeseries":  "EC预报点值时间序列 -> JSON",
             "/api/ec-list":        "列出EC预报可用时次",
             "/api/openmeteo":      "Open-Meteo点值时间序列（带缓存）-> JSON",
+            "/api/ppi_latest":     "激光雷达PPI最新完整圈 径向风速 PNG+TIF -> ZIP",
+            "/api/ppi_vad_latest": "激光雷达PPI最新完整圈 VAD反演风场 PNG+TIF -> ZIP",
         },
         "workers": ["converter_worker.py", "plot_worker.py", "slice_worker.py",
-                    "ec_worker.py", "ec_point_worker.py", "cache.py"],
+                    "ec_worker.py", "ec_point_worker.py", "cache.py",
+                    "ppi_worker.py", "ppi_vad_worker.py"],
         "max_file_size": "100MB",
     })
 
@@ -949,6 +952,97 @@ def openmeteo_point():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# PPI 最新完整圈（ppi_worker / ppi_vad_worker）
+# ---------------------------------------------------------------------------
+
+def _ppi_common(worker_script, zip_name):
+    """
+    公共逻辑：解析请求体中的 files 列表，调用指定 worker，
+    读取 result.json 判断是否跳过，否则打包 PNG+TIF 返回 ZIP。
+    """
+    task_id     = str(uuid.uuid4())
+    work_dir    = os.path.join(TEMP_BASE, task_id)
+    config_file = os.path.join(TEMP_BASE, f'{task_id}_config.json')
+    zip_path    = os.path.join(TEMP_BASE, f'{task_id}_result.zip')
+
+    try:
+        body = request.get_json(force=True, silent=True)
+        if not body or 'files' not in body:
+            return jsonify({"error": "请求体须为 JSON，包含 files 字段（文件路径列表）"}), 400
+
+        files = body['files']
+        if not isinstance(files, list) or len(files) == 0:
+            return jsonify({"error": "files 须为非空列表"}), 400
+
+        os.makedirs(work_dir, exist_ok=True)
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump({"files": files}, f, ensure_ascii=False)
+
+        cmd = ['python3', os.path.join(SERVICE_DIR, worker_script),
+               config_file, work_dir]
+        rc, _, stderr = run_worker(cmd, timeout=300)
+        if rc != 0:
+            return jsonify({"error": f"{worker_script} 返回错误码 {rc}: {stderr}"}), 500
+
+        result_json = os.path.join(work_dir, 'result.json')
+        if not os.path.exists(result_json):
+            return jsonify({"error": "worker 未写出 result.json"}), 500
+        with open(result_json, encoding='utf-8') as rf:
+            worker_result = json.load(rf)
+
+        if 'error' in worker_result:
+            return jsonify(worker_result), 500
+        if worker_result.get('skipped'):
+            return jsonify(worker_result), 200
+
+        out_files = [os.path.join(work_dir, fn) for fn in os.listdir(work_dir)
+                     if fn.endswith('.png') or fn.endswith('.tif')]
+        if not out_files:
+            return jsonify({"error": "worker 未生成任何输出文件"}), 500
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fp in out_files:
+                zf.write(fp, os.path.basename(fp))
+
+        return send_file(zip_path, mimetype='application/zip',
+                         as_attachment=True, download_name=zip_name)
+
+    except Exception as e:
+        logger.error(f"{worker_script} 失败: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cleanup_later(config_file, zip_path, work_dir)
+
+
+@app.route('/api/ppi_latest', methods=['POST'])
+def ppi_latest():
+    """
+    从给定 CSV 文件中找最新完整 PPI 圈，生成径向风速 PNG + GeoTIFF。
+
+    请求体 (JSON):
+        files  list  CSV 文件绝对路径列表，按时间从旧到新排列（必填）
+
+    返回: ZIP（ppi_*.png + ppi_*.tif），或跳过时返回 JSON {"skipped": true}
+    """
+    return _ppi_common('ppi_worker.py', 'ppi_latest.zip')
+
+
+@app.route('/api/ppi_vad_latest', methods=['POST'])
+def ppi_vad_latest():
+    """
+    从给定 CSV 文件中找最新完整 PPI 圈，在径向风速输出基础上额外
+    用 VAD 方法反演水平风场，生成风速 GeoTIFF + 风矢量 PNG。
+
+    请求体 (JSON):
+        files  list  CSV 文件绝对路径列表，按时间从旧到新排列（必填）
+
+    返回: ZIP（ppi_*.png + ppi_*.tif + wind_speed_*.tif + wind_uv_*.png），
+          或跳过时返回 JSON {"skipped": true}
+    """
+    return _ppi_common('ppi_vad_worker.py', 'ppi_vad_latest.zip')
 
 
 # ---------------------------------------------------------------------------
