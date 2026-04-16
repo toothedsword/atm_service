@@ -25,15 +25,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.patheffects as pe
-from matplotlib import font_manager
+from matplotlib.font_manager import FontProperties
 
 import numpy as np
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.crs import CRS
 
-# 复用 ppi_worker 的解析、字体、常量、出图逻辑
+# 复用 ppi_worker 的解析、常量、出图逻辑
 import ppi_worker as _pw
+
+# ── 中文字体 ──────────────────────────────────────────────────────────────────
+yh_font = FontProperties(fname='/usr/share/fonts/msyh.ttc')
 
 # ── 共用常量别名 ───────────────────────────────────────────────────────────────
 RANGE_STEP  = _pw.RANGE_STEP
@@ -147,16 +150,16 @@ def save_wind_png(U_grid, V_grid, speed, ge, gn, rlon, rlat, ext, beams, path):
     fig.patch.set_facecolor("#1a1a2e")
     ax.set_facecolor("#1a1a2e")
 
-    # 风速填色
+    # 风速填色（jet 色表）
     vmax = np.nanpercentile(speed, 98) if np.any(~np.isnan(speed)) else 20.0
     vmax = max(vmax, 1.0)
-    pcm = ax.pcolormesh(LON, LAT, speed, cmap="YlOrRd",
+    pcm = ax.pcolormesh(LON, LAT, speed, cmap="jet",
                         vmin=0, vmax=vmax,
                         shading="auto", zorder=1)
 
-    # 风矢量（稀疏采样，白色箭头+黑色描边）
+    # 风矢量（稀疏采样，白色修长箭头+黑色描边）
     n = len(ge)
-    step = max(1, n // 25)          # 约 25×25 个箭头
+    step = max(1, n // 20)          # 约 20×20 个箭头
     sl = slice(None, None, step)
     LON_q = LON[sl, sl]
     LAT_q = LAT[sl, sl]
@@ -168,17 +171,19 @@ def save_wind_png(U_grid, V_grid, speed, ge, gn, rlon, rlat, ext, beams, path):
             LON_q[valid], LAT_q[valid],
             U_q[valid],   V_q[valid],
             color="white",
-            scale=None, scale_units="inches",
-            width=0.004, headwidth=4, headlength=5,
+            scale=150,              # scale 越大箭头越短
+            width=0.0018,
+            headwidth=3,
+            headlength=6,
+            headaxislength=5,
             zorder=5,
         )
         q.set_path_effects([
-            pe.Stroke(linewidth=2.5, foreground="black"),
+            pe.Stroke(linewidth=2.0, foreground="black"),
             pe.Normal(),
         ])
         # 图例箭头
-        ref_spd = round(vmax * 0.4)
-        ref_spd = max(ref_spd, 1)
+        ref_spd = max(round(vmax * 0.4), 1)
         ax.quiverkey(q, 0.88, 0.05, ref_spd,
                      f"{ref_spd} m/s",
                      labelpos="E", color="white",
@@ -210,15 +215,18 @@ def save_wind_png(U_grid, V_grid, speed, ge, gn, rlon, rlat, ext, beams, path):
     ax.plot(rlon, rlat, "w^", ms=8, zorder=5)
 
     cb = plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label("风速 (m/s)", color="white", fontsize=11)
+    cb.set_label("风速 (m/s)", color="white", fontsize=11,
+                 fontproperties=yh_font)
     cb.ax.yaxis.set_tick_params(color="white")
     plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
 
     ax.tick_params(colors="white", labelsize=8)
     for sp in ax.spines.values():
         sp.set_edgecolor("white")
-    ax.set_xlabel("经度 (°E)", color="white", fontsize=10)
-    ax.set_ylabel("纬度 (°N)", color="white", fontsize=10)
+    ax.set_xlabel("经度 (°E)", color="white", fontsize=10,
+                  fontproperties=yh_font)
+    ax.set_ylabel("纬度 (°N)", color="white", fontsize=10,
+                  fontproperties=yh_font)
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f°"))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f°"))
 
@@ -228,8 +236,9 @@ def save_wind_png(U_grid, V_grid, speed, ge, gn, rlon, rlat, ext, beams, path):
         f"VAD 反演水平风场\n"
         f"{t0} ~ {t1}   仰角 {beams[0]['el']}°   {len(beams)} 波束",
         color="white", fontsize=11, pad=10,
+        fontproperties=yh_font,
     )
-    ax.set_aspect("equal")
+    ax.set_aspect(dpo / dpl)   # 1/cos(lat)，使物理圆在屏幕上仍为圆
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())

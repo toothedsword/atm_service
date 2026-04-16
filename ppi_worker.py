@@ -30,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from matplotlib import font_manager
+from matplotlib.font_manager import FontProperties
 
 import numpy as np
 from scipy.interpolate import griddata
@@ -39,32 +39,7 @@ from rasterio.transform import from_bounds
 from rasterio.crs import CRS
 
 # ── 中文字体 ──────────────────────────────────────────────────────────────────
-def _setup_cjk_font():
-    _name_candidates = [
-        "Noto Sans CJK SC", "Noto Serif CJK SC",
-        "Noto Serif SC", "Noto Sans SC",
-        "AR PL UMing TW", "AR PL UKai TW",
-    ]
-    for _n in _name_candidates:
-        if any(f.name == _n for f in font_manager.fontManager.ttflist):
-            matplotlib.rcParams["font.family"] = _n
-            return
-    _path_candidates = [
-        os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "NotoSansCJK-Regular.ttc"),
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/NotoSerifSC-VF.ttf",
-        "/usr/local/share/fonts/opentype/noto/NotoSerifCJK-Medium.ttc",
-        "/usr/share/fonts/msyh.ttc",
-        os.path.join(os.path.dirname(__file__), "msyh.ttc"),
-    ]
-    for _p in _path_candidates:
-        if os.path.exists(_p):
-            font_manager.fontManager.addfont(_p)
-            _name = font_manager.FontProperties(fname=_p).get_name()
-            matplotlib.rcParams["font.family"] = _name
-            return
-
-_setup_cjk_font()
+yh_font = FontProperties(fname='/usr/share/fonts/msyh.ttc')
 
 # ── 参数 ──────────────────────────────────────────────────────────────────────
 RANGE_STEP     = 60        # 距离库步长（米）
@@ -236,15 +211,18 @@ def save_png(grid, ge, gn, rlon, rlat, ext, beams, path):
     ax.plot(rlon, rlat, "w^", ms=8, zorder=5)
 
     cb = plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label("径向风速 (m/s)", color="white", fontsize=11)
+    cb.set_label("径向风速 (m/s)", color="white", fontsize=11,
+                 fontproperties=yh_font)
     cb.ax.yaxis.set_tick_params(color="white")
     plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
 
     ax.tick_params(colors="white", labelsize=8)
     for sp in ax.spines.values():
         sp.set_edgecolor("white")
-    ax.set_xlabel("经度 (°E)", color="white", fontsize=10)
-    ax.set_ylabel("纬度 (°N)", color="white", fontsize=10)
+    ax.set_xlabel("经度 (°E)", color="white", fontsize=10,
+                  fontproperties=yh_font)
+    ax.set_ylabel("纬度 (°N)", color="white", fontsize=10,
+                  fontproperties=yh_font)
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f°"))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f°"))
 
@@ -255,8 +233,9 @@ def save_png(grid, ge, gn, rlon, rlat, ext, beams, path):
         f"{t0} ~ {t1}   仰角 {beams[0]['el']}°   "
         f"{len(beams)} 波束   最大距离 {MAX_RANGE_M/1000:.0f} km",
         color="white", fontsize=11, pad=10,
+        fontproperties=yh_font,
     )
-    ax.set_aspect("equal")
+    ax.set_aspect(dpo / dpl)   # 1/cos(lat)，使物理圆在屏幕上仍为圆
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
