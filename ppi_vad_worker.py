@@ -178,9 +178,10 @@ def save_wind_png(U_grid, V_grid, speed, ge, gn, rlon, rlat, ext, beams, path):
             headaxislength=5,
             zorder=5,
         )
-        q.set_path_effects([
-            pe.Stroke(linewidth=2.0, foreground="black"),
-            pe.Normal(),
+        if False:
+            q.set_path_effects([
+                pe.Stroke(linewidth=2.0, foreground="black"),
+                pe.Normal(),
         ])
         # 图例箭头
         ref_spd = max(round(vmax * 0.4), 1)
