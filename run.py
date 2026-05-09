@@ -1308,7 +1308,11 @@ def wrf_slice():
     生成 WRF 模式数据剖面图。
 
     请求体 (JSON):
-        data_dir         str    WRF 数据目录 (可选，默认 WRF_DATA_DIR 环境变量)
+        files            dict   变量名 -> 文件绝对路径，例如:
+                                  {"t": "/data/t.zip", "u": "/data/u.zip", ...}
+                                  支持的变量: t u v rh dzdt cf1 cf2 cf3 dcf1 dcf2 dcf3
+                                  与 data_dir 二选一，files 优先
+        data_dir         str    WRF 数据目录 (可选，files 未覆盖的变量从此目录查找)
         lons             list   剖面经度控制点列表 (必填)
         lats             list   剖面纬度控制点列表 (必填)
         time_idx         int    时间索引 (可选，默认 0)
@@ -1331,13 +1335,19 @@ def wrf_slice():
 
         cfg = request.get_json()
 
-        if 'lons' not in cfg or 'lats' not in cfg:
-            return jsonify({"success": False, "error": "缺少必填字段: lons / lats"}), 400
-        if len(cfg['lons']) < 2 or len(cfg['lons']) != len(cfg['lats']):
+        if 'waypoints' not in cfg and ('lons' not in cfg or 'lats' not in cfg):
             return jsonify({"success": False,
-                            "error": "lons 和 lats 长度须相同且至少含 2 个点"}), 400
+                            "error": "缺少必填字段: waypoints 或 lons/lats"}), 400
+        if 'waypoints' in cfg and len(cfg['waypoints']) < 2:
+            return jsonify({"success": False,
+                            "error": "waypoints 至少需要 2 个点"}), 400
+        if 'lons' in cfg and 'lats' in cfg:
+            if len(cfg['lons']) < 2 or len(cfg['lons']) != len(cfg['lats']):
+                return jsonify({"success": False,
+                                "error": "lons 和 lats 长度须相同且至少含 2 个点"}), 400
 
-        cfg.setdefault('data_dir', _WRF_DATA_DIR)
+        if 'files' not in cfg and 'data_dir' not in cfg:
+            cfg['data_dir'] = _WRF_DATA_DIR
 
         os.makedirs(output_dir, exist_ok=True)
         with open(config_file, 'w', encoding='utf-8') as f:

@@ -7,12 +7,21 @@ wrf_slice_worker.py - WRF 模式数据剖面图绘制工作进程
     python3 wrf_slice_worker.py <config_json> <output_dir>
 
 config_json 字段:
-    data_dir        str   WRF 数据目录（含 .dat 或 .zip 文件）
-    lons            list  剖面经度控制点列表
-    lats            list  剖面纬度控制点列表
-    time_idx        int   时间索引（默认 0）
+    waypoints       list  航迹控制点，每个点含 lon/lat/time，例如：
+                          [{"lon":100,"lat":30,"time":"202605060000"}, ...]
+                          time 格式：yyyymmddhh 或 yyyymmddhhmm
+                          提供 waypoints 时自动做时空联合插值；
+                          也可只提供 lons/lats（无时间，用 time_idx）
+    lons            list  剖面经度控制点列表（waypoints 的替代写法）
+    lats            list  剖面纬度控制点列表（waypoints 的替代写法）
+    time_idx        int   时间索引（仅在无 waypoints 时生效，默认 0）
+    base_time       str   WRF 数据起始时间 yyyymmddhh（timeList 为整数时必填）
+    time_step_hours float WRF 数据时间间隔小时数（timeList 为整数时必填，默认 1）
+    files           list  变量文件路径列表（自动从文件名识别变量名）
+    data_dir        str   WRF 数据目录（files 未覆盖的变量从此目录查找）
     flight_height_km float 航线高度(km)（默认 2.5）
     nx_points       int   剖面插值点数（默认 200）
+    max_height_km   float 纵轴最大高度 km（默认 6.0）
     label           str   标签（默认 WRF）
     plot_types      list  绘图类型：rh / ws / dzdt / cf（默认全部）
 """
@@ -134,6 +143,43 @@ def load_topo():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  时间工具
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from datetime import datetime, timedelta
+
+def parse_dt(s):
+    """解析时间字符串为 datetime，支持 yyyymmddhh / yyyymmddhhmm。"""
+    s = str(s).strip()
+    for fmt in ('%Y%m%d%H%M', '%Y%m%d%H'):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f'无法解析时间: {s!r}')
+
+
+def parse_wrf_times(time_list, base_time=None, step_hours=1.0):
+    """
+    将 WRF header 里的 timeList 转为 datetime 列表。
+    - 若元素是 yyyymmddhh(mm) 字符串，直接解析。
+    - 若是整数/纯数字，当作从 base_time 开始的小时偏移。
+    """
+    result = []
+    for t in time_list:
+        s = str(t).strip()
+        if re.match(r'^\d{10,12}$', s):
+            result.append(parse_dt(s))
+        else:
+            # 纯数字索引，转为小时偏移
+            if base_time is None:
+                raise ValueError(
+                    'timeList 为整数索引，请在 config 中提供 base_time (yyyymmddhh)')
+            result.append(base_time + timedelta(hours=float(s) * step_hours))
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  剖面生成
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -173,6 +219,27 @@ def gen_track(lons, lats, nx=200):
     return x, y, dis
 
 
+def gen_track_times(track_dis, wp_lons, wp_lats, wp_times):
+    """
+    沿航迹按累积距离线性插值时间。
+    wp_times: 各控制点的 datetime 列表（与 wp_lons/wp_lats 一一对应）。
+    返回每个插值点的 datetime 列表。
+    """
+    # 控制点对应的累积距离
+    n_wp = len(wp_lons)
+    wp_dis = [0.0]
+    for i in range(1, n_wp):
+        wp_dis.append(wp_dis[-1] + latlon2dis(wp_lats[i-1], wp_lons[i-1],
+                                               wp_lats[i],   wp_lons[i]))
+    wp_dis = np.array(wp_dis)
+
+    # 将时间转为秒偏移，然后插值
+    t0 = wp_times[0]
+    wp_sec = np.array([(t - t0).total_seconds() for t in wp_times])
+    track_sec = np.interp(track_dis, wp_dis, wp_sec)
+    return [t0 + timedelta(seconds=float(s)) for s in track_sec]
+
+
 def interp_profile(var4d, lon_data, lat_data, lev_hpa,
                    track_lons, track_lats, z_km_out, t_idx=0):
     """
@@ -205,6 +272,81 @@ def interp_profile(var4d, lon_data, lat_data, lev_hpa,
         ])
         out[:, i] = f3d(pts)
 
+    return out
+
+
+def interp_profile_with_time(var4d, lon_data, lat_data, lev_hpa, wrf_times,
+                              track_lons, track_lats, track_times, z_km_out):
+    """
+    时空联合插值：4D(time,lev,lat,lon) → 2D(z,x)。
+    每个航迹点有独立时间，先空间插值相邻两个时次，再线性加权。
+    """
+    # WRF 时间轴（秒）
+    t0 = wrf_times[0]
+    wrf_sec = np.array([(t - t0).total_seconds() for t in wrf_times])
+    track_sec = np.array([(t - t0).total_seconds() for t in track_times])
+
+    # 各航迹点的时间分数索引
+    track_sec_c = np.clip(track_sec, wrf_sec[0], wrf_sec[-1])
+    t_frac = np.interp(track_sec_c, wrf_sec, np.arange(len(wrf_times)))
+    t_lo_arr = np.clip(np.floor(t_frac).astype(int), 0, len(wrf_times) - 2)
+    t_hi_arr = t_lo_arr + 1
+    alpha_arr = (t_frac - t_lo_arr).astype(np.float32)
+
+    # 只计算实际用到的时次（避免重复计算）
+    needed_t = sorted(set(t_lo_arr.tolist() + t_hi_arr.tolist()))
+    profiles = {}
+    for ti in needed_t:
+        profiles[ti] = interp_profile(var4d, lon_data, lat_data, lev_hpa,
+                                       track_lons, track_lats, z_km_out, t_idx=ti)
+
+    nz = len(z_km_out)
+    nx = len(track_lons)
+    out = np.full((nz, nx), np.nan, dtype=np.float32)
+    for i in range(nx):
+        lo = profiles[t_lo_arr[i]][:, i]
+        hi = profiles[t_hi_arr[i]][:, i]
+        a  = alpha_arr[i]
+        valid = ~np.isnan(lo) & ~np.isnan(hi)
+        out[valid, i] = (1 - a) * lo[valid] + a * hi[valid]
+        only_lo = ~np.isnan(lo) & np.isnan(hi)
+        only_hi = np.isnan(lo) & ~np.isnan(hi)
+        out[only_lo, i] = lo[only_lo]
+        out[only_hi, i] = hi[only_hi]
+    return out
+
+
+def interp_2d_with_time(arr4d, lon_data, lat_data, wrf_times,
+                         track_lons, track_lats, track_times):
+    """单层 2D 字段的时空插值，返回 (n_track,)。"""
+    t0 = wrf_times[0]
+    wrf_sec = np.array([(t - t0).total_seconds() for t in wrf_times])
+    track_sec = np.clip(
+        np.array([(t - t0).total_seconds() for t in track_times]),
+        wrf_sec[0], wrf_sec[-1])
+    t_frac = np.interp(track_sec, wrf_sec, np.arange(len(wrf_times)))
+    t_lo_arr = np.clip(np.floor(t_frac).astype(int), 0, len(wrf_times) - 2)
+    t_hi_arr = t_lo_arr + 1
+    alpha_arr = (t_frac - t_lo_arr).astype(np.float32)
+
+    pts = np.column_stack([track_lats, track_lons])
+    needed_t = sorted(set(t_lo_arr.tolist() + t_hi_arr.tolist()))
+    slices = {}
+    for ti in needed_t:
+        f2d = RegularGridInterpolator(
+            (lat_data, lon_data), arr4d[ti, 0],
+            method='linear', bounds_error=False, fill_value=np.nan)
+        slices[ti] = f2d(pts)
+
+    out = np.full(len(track_lons), np.nan, dtype=np.float32)
+    for i in range(len(track_lons)):
+        lo, hi, a = slices[t_lo_arr[i]][i], slices[t_hi_arr[i]][i], alpha_arr[i]
+        if not np.isnan(lo) and not np.isnan(hi):
+            out[i] = (1 - a) * lo + a * hi
+        elif not np.isnan(lo):
+            out[i] = lo
+        elif not np.isnan(hi):
+            out[i] = hi
     return out
 
 
@@ -390,20 +532,54 @@ def process(config_file, output_dir):
     with open(config_file, encoding='utf-8') as f:
         cfg = json.load(f)
 
-    data_dir = cfg['data_dir']
-    lons     = cfg['lons']
-    lats     = cfg['lats']
-    t_idx    = int(cfg.get('time_idx', 0))
-    nx_pts   = int(cfg.get('nx_points', 200))
-    label    = cfg.get('label', 'WRF')
+    nx_pts     = int(cfg.get('nx_points', 200))
+    label      = cfg.get('label', 'WRF')
     plot_types = cfg.get('plot_types', ['rh', 'ws', 'dzdt', 'cf'])
 
-    print(f'Data dir: {data_dir}')
+    # ── 航迹控制点（支持带时间的 waypoints 或纯坐标的 lons/lats）──────────────
+    if 'waypoints' in cfg:
+        wps = cfg['waypoints']
+        lons     = [w['lon']  for w in wps]
+        lats     = [w['lat']  for w in wps]
+        wp_times = [parse_dt(w['time']) for w in wps]
+        use_time_interp = True
+    else:
+        lons     = cfg['lons']
+        lats     = cfg['lats']
+        wp_times = None
+        use_time_interp = False
+
+    t_idx = int(cfg.get('time_idx', 0))  # 仅 use_time_interp=False 时用
+
+    # ── 文件映射 ─────────────────────────────────────────────────────────────
+    raw_files = cfg.get('files', {})
+    if isinstance(raw_files, list):
+        data_files = {}
+        for fp in raw_files:
+            m = re.search(r'_([a-zA-Z0-9]+)_(all|single)_', os.path.basename(fp))
+            if m:
+                data_files[m.group(1)] = fp
+    else:
+        data_files = raw_files
+
+    data_dir = cfg.get('data_dir')
+
+    def find_file(vname):
+        if vname in data_files:
+            return data_files[vname]
+        if data_dir:
+            return find_var_file(data_dir, vname)
+        return None
+
     print(f'Track: {list(zip(lons, lats))}')
 
     # ── 生成航迹 ─────────────────────────────────────────────────────────────
     track_x, track_y, track_dis = gen_track(lons, lats, nx_pts)
     n = len(track_x)
+
+    # 按距离插值出每个航迹点的时间
+    if use_time_interp:
+        track_times = gen_track_times(track_dis, lons, lats, wp_times)
 
     # ── 高度网格（0 ~ max_km km，50 层）────────────────────────────────────
     max_z_km = float(cfg.get('max_height_km', 6.0))
@@ -429,14 +605,21 @@ def process(config_file, output_dir):
     if 'cf' in plot_types:
         needed -= {'cf', 'dcf'}
 
-    raw_vars = {}   # varname -> (header, arr4d, lon, lat, lev)
+    # base_time / time_step 用于 timeList 是整数索引的情况
+    base_time_cfg  = parse_dt(cfg['base_time']) if 'base_time' in cfg else None
+    time_step_hrs  = float(cfg.get('time_step_hours', 1.0))
+
+    raw_vars = {}   # varname -> (arr4d, lon, lat, lev, wrf_times_or_None)
     for vname in needed:
-        fp = find_var_file(data_dir, vname)
+        fp = find_file(vname)
         if fp is None:
-            print(f'Warning: variable {vname} not found in {data_dir}')
+            print(f'Warning: variable {vname} not found')
             continue
         print(f'Reading {vname}: {fp}')
-        raw_vars[vname] = read_wrf_file(fp)
+        hdr, arr4d, lon_d, lat_d, lev_d = read_wrf_file(fp)
+        wrf_t = (parse_wrf_times(hdr['timeList'], base_time_cfg, time_step_hrs)
+                 if use_time_interp else None)
+        raw_vars[vname] = (arr4d, lon_d, lat_d, lev_d, wrf_t)
 
     # ── 插值到剖面网格 ────────────────────────────────────────────────────────
     lv_vars_cache = {}
@@ -446,10 +629,15 @@ def process(config_file, output_dir):
             return lv_vars_cache[vname]
         if vname not in raw_vars:
             return None
-        hdr, arr4d, lon_d, lat_d, lev_d = raw_vars[vname]
+        arr4d, lon_d, lat_d, lev_d, wrf_t = raw_vars[vname]
         print(f'Interpolating {vname}...')
-        result = interp_profile(arr4d, lon_d, lat_d, lev_d,
-                                track_x, track_y, z_km, t_idx)
+        if use_time_interp:
+            result = interp_profile_with_time(arr4d, lon_d, lat_d, lev_d, wrf_t,
+                                               track_x, track_y, track_times, z_km)
+        else:
+            ti = min(t_idx, arr4d.shape[0] - 1)
+            result = interp_profile(arr4d, lon_d, lat_d, lev_d,
+                                    track_x, track_y, z_km, ti)
         lv_vars_cache[vname] = result
         return result
 
@@ -474,17 +662,22 @@ def process(config_file, output_dir):
             def _merge_single_level(ranges):
                 merged = np.full((len(z_km), n), np.nan)
                 for (vname, z_lo, z_hi) in ranges:
-                    fp = find_var_file(data_dir, vname)
+                    fp = find_file(vname)
                     if fp is None:
                         continue
-                    _, arr4d, lon_d, lat_d, _ = read_wrf_file(fp)
-                    # 单层 2D 数据：arr4d shape=(nt,1,ny,nx)
-                    arr2d = arr4d[t_idx, 0]            # (ny, nx)
-                    f2d = RegularGridInterpolator(
-                        (lat_d, lon_d), arr2d,
-                        method='linear', bounds_error=False, fill_value=np.nan)
-                    pts = np.column_stack([track_y, track_x])
-                    track_vals = f2d(pts)              # (n,)
+                    hdr_s, arr4d, lon_d, lat_d, _ = read_wrf_file(fp)
+                    wrf_t = (parse_wrf_times(hdr_s['timeList'], base_time_cfg, time_step_hrs)
+                             if use_time_interp else None)
+                    if use_time_interp:
+                        track_vals = interp_2d_with_time(
+                            arr4d, lon_d, lat_d, wrf_t,
+                            track_x, track_y, track_times)
+                    else:
+                        ti = min(t_idx, arr4d.shape[0] - 1)
+                        f2d = RegularGridInterpolator(
+                            (lat_d, lon_d), arr4d[ti, 0],
+                            method='linear', bounds_error=False, fill_value=np.nan)
+                        track_vals = f2d(np.column_stack([track_y, track_x]))
                     mask = (z_km >= z_lo) & (z_km < z_hi)
                     merged[mask, :] = track_vals[np.newaxis, :]
                 return merged
