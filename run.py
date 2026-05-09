@@ -204,10 +204,11 @@ def get_service_info():
             "/api/openmeteo_profile": "Open-Meteo垂直高度层剖面（风速/风向/温度，15层100~30000m）-> JSON",
             "/api/ppi_latest":     "激光雷达PPI最新完整圈 径向风速 PNG+TIF -> ZIP",
             "/api/ppi_vad_latest": "激光雷达PPI最新完整圈 VAD反演风场 PNG+TIF -> ZIP",
+            "/api/wrf_slice":      "WRF模式数据剖面图（温湿/风切/垂直速度/云水）-> PNG或ZIP",
         },
         "workers": ["converter_worker.py", "plot_worker.py", "slice_worker.py",
                     "ec_worker.py", "ec_point_worker.py", "cache.py",
-                    "ppi_worker.py", "ppi_vad_worker.py"],
+                    "ppi_worker.py", "ppi_vad_worker.py", "wrf_slice_worker.py"],
         "max_file_size": "100MB",
     })
 
@@ -1292,6 +1293,97 @@ def ppi_vad_latest():
           或跳过时返回 JSON {"skipped": true}
     """
     return _ppi_common('ppi_vad_worker.py', 'ppi_vad_latest.zip')
+
+
+# ---------------------------------------------------------------------------
+# WRF 剖面图（通过 wrf_slice_worker.py 子进程处理）
+# ---------------------------------------------------------------------------
+
+_WRF_DATA_DIR = os.environ.get('WRF_DATA_DIR', '/home/leon/Downloads/atm_service/tmp/data')
+
+
+@app.route('/api/wrf_slice', methods=['POST'])
+def wrf_slice():
+    """
+    生成 WRF 模式数据剖面图。
+
+    请求体 (JSON):
+        data_dir         str    WRF 数据目录 (可选，默认 WRF_DATA_DIR 环境变量)
+        lons             list   剖面经度控制点列表 (必填)
+        lats             list   剖面纬度控制点列表 (必填)
+        time_idx         int    时间索引 (可选，默认 0)
+        flight_height_km float  航线高度 km (可选，默认 2.5)
+        nx_points        int    剖面插值点数 (可选，默认 200)
+        max_height_km    float  纵轴最大高度 km (可选，默认 6.0)
+        label            str    输出文件标签 (可选，默认 WRF)
+        plot_types       list   绘图类型列表: rh/ws/dzdt/cf (可选，默认全部)
+
+    返回: 单图时返回 image/png；多图时返回 application/zip。
+    """
+    task_id    = str(uuid.uuid4())
+    config_file = os.path.join(TEMP_BASE, f'{task_id}_wrf_config.json')
+    output_dir  = os.path.join(TEMP_BASE, f'{task_id}_wrf_out')
+    zip_file    = None
+
+    try:
+        if not request.is_json:
+            return jsonify({"success": False, "error": "请提供 JSON 格式请求体"}), 400
+
+        cfg = request.get_json()
+
+        if 'lons' not in cfg or 'lats' not in cfg:
+            return jsonify({"success": False, "error": "缺少必填字段: lons / lats"}), 400
+        if len(cfg['lons']) < 2 or len(cfg['lons']) != len(cfg['lats']):
+            return jsonify({"success": False,
+                            "error": "lons 和 lats 长度须相同且至少含 2 个点"}), 400
+
+        cfg.setdefault('data_dir', _WRF_DATA_DIR)
+
+        os.makedirs(output_dir, exist_ok=True)
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        cmd = ['python3', os.path.join(SERVICE_DIR, 'wrf_slice_worker.py'),
+               config_file, output_dir]
+        rc, _, stderr = run_worker(cmd, timeout=600)
+
+        if rc != 0:
+            return jsonify({"success": False, "error": f"WRF剖面图生成失败: {stderr}"}), 500
+
+        result_json = os.path.join(output_dir, 'result.json')
+        if os.path.exists(result_json):
+            with open(result_json, encoding='utf-8') as rf:
+                worker_result = json.load(rf)
+            if 'error' in worker_result:
+                return jsonify({"success": False, "error": worker_result['error']}), 500
+
+        png_files = [os.path.join(output_dir, fn)
+                     for fn in os.listdir(output_dir) if fn.endswith('.png')]
+
+        if not png_files:
+            return jsonify({"success": False, "error": "未生成任何图片文件"}), 500
+
+        if len(png_files) == 1:
+            return send_file(png_files[0], mimetype='image/png',
+                             as_attachment=True, download_name='wrf_slice.png')
+
+        label = cfg.get('label', 'WRF')
+        zip_file = os.path.join(TEMP_BASE, f'{task_id}_wrf_plots.zip')
+        with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fp in sorted(png_files):
+                zf.write(fp, os.path.basename(fp))
+
+        return send_file(zip_file, mimetype='application/zip',
+                         as_attachment=True, download_name=f'wrf_slice_{label}.zip')
+
+    except Exception as e:
+        logger.error(f"wrf_slice 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        cleanup_later(config_file, output_dir,
+                      *([] if zip_file is None else [zip_file]))
 
 
 # ---------------------------------------------------------------------------
