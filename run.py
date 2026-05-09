@@ -200,7 +200,8 @@ def get_service_info():
             "/api/ec-forecast":    "EC预报数据提取 -> zip",
             "/api/ec-timeseries":  "EC预报点值时间序列 -> JSON",
             "/api/ec-list":        "列出EC预报可用时次",
-            "/api/openmeteo":      "Open-Meteo点值时间序列（带缓存）-> JSON",
+            "/api/openmeteo":         "Open-Meteo点值时间序列（带缓存）-> JSON",
+            "/api/openmeteo_profile": "Open-Meteo垂直高度层剖面（风速/风向/温度，15层100~30000m）-> JSON",
             "/api/ppi_latest":     "激光雷达PPI最新完整圈 径向风速 PNG+TIF -> ZIP",
             "/api/ppi_vad_latest": "激光雷达PPI最新完整圈 VAD反演风场 PNG+TIF -> ZIP",
         },
@@ -715,12 +716,34 @@ _OM_GRID_RES        = 0.125
 _OM_ALL_VARS        = [
     'temperature_2m', 'relativehumidity_2m', 'precipitation',
     'windspeed_10m', 'winddirection_10m', 'windgusts_10m',
+    'windspeed_80m', 'winddirection_80m',
+    'windspeed_120m', 'winddirection_120m',
+    'windspeed_180m', 'winddirection_180m',
     'surface_pressure', 'cloudcover',
 ]
 # 最后访问位置记录文件
 _OM_LAST_POS_FILE   = os.path.join(TEMP_BASE, 'openmeteo_last_pos.json')
 # 自动刷新检查间隔（秒），略小于缓存有效期，确保到期前主动续期
 _OM_AUTO_REFRESH_INTERVAL = 1800   # 30 分钟检查一次
+
+# 等压面列表（hPa，从低空到高空）
+_OM_PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100, 70, 50, 30]
+
+# 默认目标高度层（米）
+_OM_TARGET_HEIGHTS = [100, 600, 750, 900, 1500, 2000, 3000, 4200, 5500, 7000, 9000, 10000, 11700, 13500, 30000]
+
+# 等压面剖面所需变量（近地面 + 各等压面温度/风速/风向/位势高度）
+_OM_PROFILE_VARS = (
+    ['temperature_2m',
+     'windspeed_10m',  'winddirection_10m',
+     'windspeed_80m',  'winddirection_80m',
+     'windspeed_120m', 'winddirection_120m',
+     'windspeed_180m', 'winddirection_180m']
+    + [v
+       for p in _OM_PRESSURE_LEVELS
+       for v in (f'temperature_{p}hPa', f'windspeed_{p}hPa',
+                 f'winddirection_{p}hPa', f'geopotential_height_{p}hPa')]
+)
 
 
 def _om_snap(val):
@@ -857,6 +880,9 @@ def openmeteo_point():
         variables     list   变量列表，默认全部 (可选)
                              可选值: temperature_2m / relativehumidity_2m / precipitation /
                                      windspeed_10m / winddirection_10m / windgusts_10m /
+                                     windspeed_80m / winddirection_80m /
+                                     windspeed_120m / winddirection_120m /
+                                     windspeed_180m / winddirection_180m /
                                      surface_pressure / cloudcover
         datetime      str    起始时间 yyyymmddhh，只返回此时间之后的数据 (可选)
         forecast_days int    预报天数，默认 7 (可选，仅缓存未命中时生效)
@@ -949,6 +975,219 @@ def openmeteo_point():
 
     except Exception as e:
         logger.error(f"openmeteo 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Open-Meteo 垂直高度层剖面接口
+# ---------------------------------------------------------------------------
+
+def _profile_wind_to_uv(speed, direction_deg):
+    """气象风向（来向，度）+ 风速 → u, v 分量"""
+    import math
+    r = math.radians(float(direction_deg))
+    return -float(speed) * math.sin(r), -float(speed) * math.cos(r)
+
+
+def _profile_uv_to_wind(u, v):
+    """u, v 分量 → 风速, 气象风向（度）"""
+    import math
+    spd = math.sqrt(u * u + v * v)
+    if spd < 1e-8:
+        return 0.0, 0.0
+    return spd, math.degrees(math.atan2(-u, -v)) % 360
+
+
+def _std_height_m(p_hpa):
+    """标准大气压高公式，当 geopotential_height 缺失时用于高度估算"""
+    import math
+    return -8500.0 * math.log(max(p_hpa, 0.1) / 1013.25)
+
+
+def _build_single_profile(hourly, t_idx, elevation=0.0):
+    """
+    在时次 t_idx 构建垂直剖面，返回按高度升序的 (zs, us, vs, ts)。
+    所有高度均为离地高度(AGL)：近地面变量本身就是AGL；等压面的
+    geopotential_height(海拔)减去地形高度 elevation 得到AGL。
+    geopotential_height 缺失时用标准大气压高公式估算，同样减去 elevation。
+    低于地面（AGL < 0）的等压面层直接跳过。
+    """
+    zs, us, vs, ts = [], [], [], []
+
+    # 近地面固定高度层（已是离地高度，直接用）
+    t2m_arr = hourly.get('temperature_2m') or []
+    t2m = t2m_arr[t_idx] if t_idx < len(t2m_arr) else None
+    for h_fixed, ws_key, wd_key in [
+        (10,  'windspeed_10m',  'winddirection_10m'),
+        (80,  'windspeed_80m',  'winddirection_80m'),
+        (120, 'windspeed_120m', 'winddirection_120m'),
+        (180, 'windspeed_180m', 'winddirection_180m'),
+    ]:
+        ws_arr = hourly.get(ws_key) or []
+        wd_arr = hourly.get(wd_key) or []
+        if t_idx >= len(ws_arr) or t_idx >= len(wd_arr):
+            continue
+        ws, wd = ws_arr[t_idx], wd_arr[t_idx]
+        if ws is None or wd is None:
+            continue
+        u, v = _profile_wind_to_uv(ws, wd)
+        zs.append(float(h_fixed))
+        us.append(u); vs.append(v)
+        ts.append(t2m if h_fixed == 10 else None)
+
+    # 等压面层：geopotential_height 是海拔，减去地形高度得到离地高度
+    for p in _OM_PRESSURE_LEVELS:
+        ws_arr   = hourly.get(f'windspeed_{p}hPa') or []
+        wd_arr   = hourly.get(f'winddirection_{p}hPa') or []
+        temp_arr = hourly.get(f'temperature_{p}hPa') or []
+        ghgt_arr = hourly.get(f'geopotential_height_{p}hPa') or []
+        ws   = ws_arr[t_idx]   if t_idx < len(ws_arr)   else None
+        wd   = wd_arr[t_idx]   if t_idx < len(wd_arr)   else None
+        temp = temp_arr[t_idx] if t_idx < len(temp_arr) else None
+        ghgt = ghgt_arr[t_idx] if t_idx < len(ghgt_arr) else None
+        if ws is None or wd is None:
+            continue
+        # 优先用 Open-Meteo 提供的 geopotential_height，缺失时才用压高公式估算
+        z_msl = float(ghgt) if ghgt is not None else _std_height_m(p)
+        z = z_msl - elevation          # 换算为离地高度
+        if z < 0:                      # 等压面低于地面（高海拔地区），跳过
+            continue
+        u, v = _profile_wind_to_uv(ws, wd)
+        zs.append(z); us.append(u); vs.append(v); ts.append(temp)
+
+    # 按高度升序排序
+    order = sorted(range(len(zs)), key=lambda i: zs[i])
+    return ([zs[i] for i in order], [us[i] for i in order],
+            [vs[i] for i in order], [ts[i] for i in order])
+
+
+def _interp_at_height(target_h, zs, us, vs, ts):
+    """
+    在垂直剖面上插值到目标高度 target_h。
+    超出范围时用最近两层线性外推（对应"缺失层用压高公式计算"的逻辑）。
+    """
+    import bisect
+    n = len(zs)
+    if n == 0:
+        return None, None, None
+    if n == 1:
+        spd, wdir = _profile_uv_to_wind(us[0], vs[0])
+        return round(spd, 2), round(wdir, 1), (round(ts[0], 2) if ts[0] is not None else None)
+
+    # 确定插值区间索引（边界外用最近两层外推）
+    if target_h <= zs[0]:
+        i = 0
+    elif target_h >= zs[-1]:
+        i = n - 2
+    else:
+        i = bisect.bisect_right(zs, target_h) - 1
+        i = max(0, min(i, n - 2))
+
+    dz   = zs[i + 1] - zs[i]
+    frac = 0.0 if abs(dz) < 1e-3 else (target_h - zs[i]) / dz
+    u_t  = us[i] + frac * (us[i + 1] - us[i])
+    v_t  = vs[i] + frac * (vs[i + 1] - vs[i])
+    t_t  = (ts[i] + frac * (ts[i + 1] - ts[i])
+            if ts[i] is not None and ts[i + 1] is not None else None)
+
+    spd, wdir = _profile_uv_to_wind(u_t, v_t)
+    return round(spd, 2), round(wdir, 1), (round(t_t, 2) if t_t is not None else None)
+
+
+def _om_fetch_profile(lat, lon, forecast_days=7):
+    """请求 Open-Meteo 等压面剖面数据，风速单位 m/s"""
+    import urllib.request
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        'latitude':        lat,
+        'longitude':       lon,
+        'hourly':          ','.join(_OM_PROFILE_VARS),
+        'forecast_days':   forecast_days,
+        'timezone':        'UTC',
+        'wind_speed_unit': 'ms',
+    })
+    url = f'https://api.open-meteo.com/v1/forecast?{params}'
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+@app.route('/api/openmeteo_profile', methods=['POST'])
+def openmeteo_profile():
+    """
+    返回指定高度层（m）的风速(m/s)、风向(°)、温度(℃)时间序列。
+    Open-Meteo 等压面 geopotential_height 用于高度定位；缺测时以标准大气压高公式代替。
+    超出 30 hPa（≈23.8 km）的高度层（如 30000 m）用最近两层线性外推。
+
+    请求体 (JSON):
+        lat           float  纬度 (必填)
+        lon           float  经度 (必填)
+        heights       list   目标高度列表 (m，默认15层: 100~30000 m)
+        datetime      str    起始时间 yyyymmddhh (可选)
+        forecast_days int    预报天数，默认 7
+
+    返回 JSON:
+        {success, lat, lon, heights, times[], count, units,
+         h100m_windspeed[], h100m_winddirection[], h100m_temperature[], ...}
+    """
+    try:
+        if not request.is_json:
+            return jsonify({"success": False, "error": "请提供 JSON 格式请求体"}), 400
+
+        params = request.get_json()
+        if 'lat' not in params or 'lon' not in params:
+            return jsonify({"success": False, "error": "缺少必填字段: lat / lon"}), 400
+
+        req_lat       = float(params['lat'])
+        req_lon       = float(params['lon'])
+        heights       = [float(h) for h in params.get('heights', _OM_TARGET_HEIGHTS)]
+        start_time    = params.get('datetime')
+        forecast_days = int(params.get('forecast_days', 7))
+
+        snap_lat = _om_snap(req_lat)
+        snap_lon = _om_snap(req_lon)
+
+        logger.info(f"openmeteo_profile 请求: ({snap_lat}, {snap_lon})  "
+                    f"heights={heights}  forecast_days={forecast_days}")
+        om_data   = _om_fetch_profile(snap_lat, snap_lon, forecast_days)
+        elevation = float(om_data.get('elevation', 0.0))   # 地形海拔(m)
+        hourly    = om_data.get('hourly', {})
+        times     = _om_parse_times(hourly.get('time', []))
+
+        idx0 = next((i for i, t in enumerate(times) if t >= start_time), 0) if start_time else 0
+        times = times[idx0:]
+        n_times = len(times)
+
+        result = {h: {'windspeed': [], 'winddirection': [], 'temperature': []} for h in heights}
+        for ti in range(idx0, idx0 + n_times):
+            zs, us, vs, ts = _build_single_profile(hourly, ti, elevation)
+            for h in heights:
+                ws, wd, temp = _interp_at_height(h, zs, us, vs, ts)
+                result[h]['windspeed'].append(ws)
+                result[h]['winddirection'].append(wd)
+                result[h]['temperature'].append(temp)
+
+        resp = {
+            "success":   True,
+            "lat":       snap_lat,
+            "lon":       snap_lon,
+            "elevation": elevation,
+            "heights":   heights,
+            "times":     times,
+            "count":     n_times,
+            "units":     {"windspeed": "m/s", "winddirection": "degrees", "temperature": "°C"},
+        }
+        for h in heights:
+            key = f'h{int(h)}m' if h == int(h) else f'h{h}m'
+            resp[f'{key}_windspeed']     = result[h]['windspeed']
+            resp[f'{key}_winddirection'] = result[h]['winddirection']
+            resp[f'{key}_temperature']   = result[h]['temperature']
+
+        return jsonify(resp)
+
+    except Exception as e:
+        logger.error(f"openmeteo_profile 失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"success": False, "error": str(e)}), 500
