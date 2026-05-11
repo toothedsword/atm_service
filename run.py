@@ -715,12 +715,12 @@ _OM_CACHE_DIR       = '/tmp/atm_service/openmeteo_cache'
 _OM_CACHE_TTL       = 3600
 _OM_GRID_RES        = 0.125
 _OM_ALL_VARS        = [
-    'temperature_2m', 'relativehumidity_2m', 'precipitation',
+    'temperature_2m', 'relativehumidity_2m', 'rain', 'snowfall',
     'windspeed_10m', 'winddirection_10m', 'windgusts_10m',
     'windspeed_80m', 'winddirection_80m',
     'windspeed_120m', 'winddirection_120m',
     'windspeed_180m', 'winddirection_180m',
-    'surface_pressure', 'cloudcover',
+    'surface_pressure', 'cloudcover', 'visibility',
 ]
 # 最后访问位置记录文件
 _OM_LAST_POS_FILE   = os.path.join(TEMP_BASE, 'openmeteo_last_pos.json')
@@ -733,9 +733,10 @@ _OM_PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 3
 # 默认目标高度层（米）
 _OM_TARGET_HEIGHTS = [100, 600, 750, 900, 1500, 2000, 3000, 4200, 5500, 7000, 9000, 10000, 11700, 13500, 30000]
 
-# 等压面剖面所需变量（近地面 + 各等压面温度/风速/风向/位势高度）
+# 等压面剖面所需变量（近地面 + 各等压面温度/风速/风向/位势高度/相对湿度）
 _OM_PROFILE_VARS = (
-    ['temperature_2m',
+    ['temperature_2m', 'relativehumidity_2m', 'rain', 'snowfall',
+     'surface_pressure', 'cloudcover', 'visibility',
      'windspeed_10m',  'winddirection_10m',
      'windspeed_80m',  'winddirection_80m',
      'windspeed_120m', 'winddirection_120m',
@@ -743,7 +744,8 @@ _OM_PROFILE_VARS = (
     + [v
        for p in _OM_PRESSURE_LEVELS
        for v in (f'temperature_{p}hPa', f'windspeed_{p}hPa',
-                 f'winddirection_{p}hPa', f'geopotential_height_{p}hPa')]
+                 f'winddirection_{p}hPa', f'geopotential_height_{p}hPa',
+                 f'relativehumidity_{p}hPa')]
 )
 
 
@@ -1009,17 +1011,19 @@ def _std_height_m(p_hpa):
 
 def _build_single_profile(hourly, t_idx, elevation=0.0):
     """
-    在时次 t_idx 构建垂直剖面，返回按高度升序的 (zs, us, vs, ts)。
+    在时次 t_idx 构建垂直剖面，返回按高度升序的 (zs, us, vs, ts, rhs)。
     所有高度均为离地高度(AGL)：近地面变量本身就是AGL；等压面的
     geopotential_height(海拔)减去地形高度 elevation 得到AGL。
     geopotential_height 缺失时用标准大气压高公式估算，同样减去 elevation。
     低于地面（AGL < 0）的等压面层直接跳过。
     """
-    zs, us, vs, ts = [], [], [], []
+    zs, us, vs, ts, rhs = [], [], [], [], []
 
     # 近地面固定高度层（已是离地高度，直接用）
-    t2m_arr = hourly.get('temperature_2m') or []
-    t2m = t2m_arr[t_idx] if t_idx < len(t2m_arr) else None
+    t2m_arr  = hourly.get('temperature_2m') or []
+    rh2m_arr = hourly.get('relativehumidity_2m') or []
+    t2m  = t2m_arr[t_idx]  if t_idx < len(t2m_arr)  else None
+    rh2m = rh2m_arr[t_idx] if t_idx < len(rh2m_arr) else None
     for h_fixed, ws_key, wd_key in [
         (10,  'windspeed_10m',  'winddirection_10m'),
         (80,  'windspeed_80m',  'winddirection_80m'),
@@ -1036,7 +1040,8 @@ def _build_single_profile(hourly, t_idx, elevation=0.0):
         u, v = _profile_wind_to_uv(ws, wd)
         zs.append(float(h_fixed))
         us.append(u); vs.append(v)
-        ts.append(t2m if h_fixed == 10 else None)
+        ts.append(t2m   if h_fixed == 10 else None)
+        rhs.append(rh2m if h_fixed == 10 else None)
 
     # 等压面层：geopotential_height 是海拔，减去地形高度得到离地高度
     for p in _OM_PRESSURE_LEVELS:
@@ -1044,10 +1049,12 @@ def _build_single_profile(hourly, t_idx, elevation=0.0):
         wd_arr   = hourly.get(f'winddirection_{p}hPa') or []
         temp_arr = hourly.get(f'temperature_{p}hPa') or []
         ghgt_arr = hourly.get(f'geopotential_height_{p}hPa') or []
+        rh_arr   = hourly.get(f'relativehumidity_{p}hPa') or []
         ws   = ws_arr[t_idx]   if t_idx < len(ws_arr)   else None
         wd   = wd_arr[t_idx]   if t_idx < len(wd_arr)   else None
         temp = temp_arr[t_idx] if t_idx < len(temp_arr) else None
         ghgt = ghgt_arr[t_idx] if t_idx < len(ghgt_arr) else None
+        rh   = rh_arr[t_idx]   if t_idx < len(rh_arr)   else None
         if ws is None or wd is None:
             continue
         # 优先用 Open-Meteo 提供的 geopotential_height，缺失时才用压高公式估算
@@ -1056,28 +1063,31 @@ def _build_single_profile(hourly, t_idx, elevation=0.0):
         if z < 0:                      # 等压面低于地面（高海拔地区），跳过
             continue
         u, v = _profile_wind_to_uv(ws, wd)
-        zs.append(z); us.append(u); vs.append(v); ts.append(temp)
+        zs.append(z); us.append(u); vs.append(v); ts.append(temp); rhs.append(rh)
 
     # 按高度升序排序
     order = sorted(range(len(zs)), key=lambda i: zs[i])
     return ([zs[i] for i in order], [us[i] for i in order],
-            [vs[i] for i in order], [ts[i] for i in order])
+            [vs[i] for i in order], [ts[i] for i in order], [rhs[i] for i in order])
 
 
-def _interp_at_height(target_h, zs, us, vs, ts):
+def _interp_at_height(target_h, zs, us, vs, ts, rhs=None):
     """
     在垂直剖面上插值到目标高度 target_h。
-    超出范围时用最近两层线性外推（对应"缺失层用压高公式计算"的逻辑）。
+    超出范围时用最近两层线性外推。
+    ts/rhs 中的 None 值会被跳过，找最近的非 None 层对进行插值。
+    返回 (windspeed, winddirection, temperature, rh)。
     """
     import bisect
     n = len(zs)
     if n == 0:
-        return None, None, None
+        return None, None, None, None
     if n == 1:
         spd, wdir = _profile_uv_to_wind(us[0], vs[0])
-        return round(spd, 2), round(wdir, 1), (round(ts[0], 2) if ts[0] is not None else None)
+        rh_out = (round(rhs[0], 2) if rhs and rhs[0] is not None else None)
+        return round(spd, 2), round(wdir, 1), (round(ts[0], 2) if ts[0] is not None else None), rh_out
 
-    # 确定插值区间索引（边界外用最近两层外推）
+    # 确定风速插值区间索引（边界外用最近两层外推）
     if target_h <= zs[0]:
         i = 0
     elif target_h >= zs[-1]:
@@ -1090,11 +1100,82 @@ def _interp_at_height(target_h, zs, us, vs, ts):
     frac = 0.0 if abs(dz) < 1e-3 else (target_h - zs[i]) / dz
     u_t  = us[i] + frac * (us[i + 1] - us[i])
     v_t  = vs[i] + frac * (vs[i + 1] - vs[i])
-    t_t  = (ts[i] + frac * (ts[i + 1] - ts[i])
-            if ts[i] is not None and ts[i + 1] is not None else None)
+
+    def _interp_scalar(vals):
+        """在可能含 None 的数组 vals 上，找目标高度最近的非 None 层对插值"""
+        # 向下找最近非 None
+        lo_v, lo_z = None, None
+        for j in range(i, -1, -1):
+            if vals[j] is not None:
+                lo_v, lo_z = vals[j], zs[j]; break
+        # 向上找最近非 None
+        hi_v, hi_z = None, None
+        for j in range(i + 1, n):
+            if vals[j] is not None:
+                hi_v, hi_z = vals[j], zs[j]; break
+        if lo_v is not None and hi_v is not None:
+            dz2 = hi_z - lo_z
+            f2  = 0.0 if abs(dz2) < 1e-3 else (target_h - lo_z) / dz2
+            return lo_v + f2 * (hi_v - lo_v)
+        return lo_v if lo_v is not None else hi_v
+
+    t_t  = _interp_scalar(ts)
+    rh_t = _interp_scalar(rhs) if rhs is not None else None
 
     spd, wdir = _profile_uv_to_wind(u_t, v_t)
-    return round(spd, 2), round(wdir, 1), (round(t_t, 2) if t_t is not None else None)
+    return (round(spd, 2), round(wdir, 1),
+            round(t_t, 2)  if t_t  is not None else None,
+            round(rh_t, 2) if rh_t is not None else None)
+
+
+def _build_pressure_profile(hourly, t_idx, elevation):
+    """
+    构建 (height_AGL, pressure_hPa) 剖面。
+    地面锚点用 surface_pressure；等压面层用 geopotential_height，缺失时用标准大气公式。
+    """
+    heights_p, pressures = [], []
+
+    sfp_arr = hourly.get('surface_pressure') or []
+    sfp = sfp_arr[t_idx] if t_idx < len(sfp_arr) else None
+    if sfp is not None and sfp > 0:
+        heights_p.append(0.0)
+        pressures.append(float(sfp))
+
+    for p in _OM_PRESSURE_LEVELS:
+        ghgt_arr = hourly.get(f'geopotential_height_{p}hPa') or []
+        ghgt = ghgt_arr[t_idx] if t_idx < len(ghgt_arr) else None
+        z_msl = float(ghgt) if (ghgt is not None and ghgt > 0) else _std_height_m(p)
+        z = z_msl - elevation
+        if z < 0:
+            continue
+        heights_p.append(z)
+        pressures.append(float(p))
+
+    order = sorted(range(len(heights_p)), key=lambda i: heights_p[i])
+    return [heights_p[i] for i in order], [pressures[i] for i in order]
+
+
+def _interp_pressure(target_h, heights_p, pressures):
+    """在高度-气压剖面上用 ln(P) 线性插值，超出范围外推"""
+    import math, bisect
+    n = len(heights_p)
+    if n == 0:
+        return None
+    if n == 1:
+        return round(pressures[0], 1)
+
+    if target_h <= heights_p[0]:
+        i = 0
+    elif target_h >= heights_p[-1]:
+        i = n - 2
+    else:
+        i = bisect.bisect_right(heights_p, target_h) - 1
+        i = max(0, min(i, n - 2))
+
+    dz = heights_p[i + 1] - heights_p[i]
+    frac = 0.0 if abs(dz) < 1e-3 else (target_h - heights_p[i]) / dz
+    lp = math.log(pressures[i]) + frac * (math.log(pressures[i + 1]) - math.log(pressures[i]))
+    return round(math.exp(lp), 1)
 
 
 def _om_fetch_profile(lat, lon, forecast_days=7):
@@ -1114,31 +1195,36 @@ def _om_fetch_profile(lat, lon, forecast_days=7):
         return json.loads(resp.read().decode('utf-8'))
 
 
+def _om_forecast_time(t_yyyymmddhh):
+    """将 yyyymmddhh 格式转为 'YYYY-MM-DD HH:MM:SS'"""
+    from datetime import datetime as _dt
+    return _dt.strptime(t_yyyymmddhh, '%Y%m%d%H').strftime('%Y-%m-%d %H:%M:%S')
+
+
 @app.route('/api/openmeteo_profile', methods=['POST'])
 def openmeteo_profile():
     """
-    返回指定高度层（m）的风速(m/s)、风向(°)、温度(℃)时间序列。
-    Open-Meteo 等压面 geopotential_height 用于高度定位；缺测时以标准大气压高公式代替。
-    超出 30 hPa（≈23.8 km）的高度层（如 30000 m）用最近两层线性外推。
+    返回 2m / 10m 近地面层及指定高度层的大气剖面时间序列。
 
     请求体 (JSON):
         lat           float  纬度 (必填)
         lon           float  经度 (必填)
-        heights       list   目标高度列表 (m，默认15层: 100~30000 m)
+        heights       list   额外目标高度列表 (m，默认15层: 100~30000 m)
         datetime      str    起始时间 yyyymmddhh (可选)
         forecast_days int    预报天数，默认 7
 
     返回 JSON:
-        {success, lat, lon, heights, times[], count, units,
-         h100m_windspeed[], h100m_winddirection[], h100m_temperature[], ...}
+        {code, message, data: [{height, sfp, cld, tem, pre, windS, windD, vis, rh, forecastTime}, ...]}
+
+    高度顺序: 2m (无风) → 10m (含10m风) → 各profile高度 (无地面量)
     """
     try:
         if not request.is_json:
-            return jsonify({"success": False, "error": "请提供 JSON 格式请求体"}), 400
+            return jsonify({"code": 1001, "message": "请提供 JSON 格式请求体"}), 400
 
         params = request.get_json()
         if 'lat' not in params or 'lon' not in params:
-            return jsonify({"success": False, "error": "缺少必填字段: lat / lon"}), 400
+            return jsonify({"code": 1001, "message": "缺少必填字段: lat / lon"}), 400
 
         req_lat       = float(params['lat'])
         req_lon       = float(params['lon'])
@@ -1152,46 +1238,120 @@ def openmeteo_profile():
         logger.info(f"openmeteo_profile 请求: ({snap_lat}, {snap_lon})  "
                     f"heights={heights}  forecast_days={forecast_days}")
         om_data   = _om_fetch_profile(snap_lat, snap_lon, forecast_days)
-        elevation = float(om_data.get('elevation', 0.0))   # 地形海拔(m)
+        elevation = float(om_data.get('elevation', 0.0))
         hourly    = om_data.get('hourly', {})
-        times     = _om_parse_times(hourly.get('time', []))
+        raw_times = _om_parse_times(hourly.get('time', []))
 
-        idx0 = next((i for i, t in enumerate(times) if t >= start_time), 0) if start_time else 0
-        times = times[idx0:]
-        n_times = len(times)
+        idx0 = next((i for i, t in enumerate(raw_times) if t >= start_time), 0) if start_time else 0
+        slice_times = raw_times[idx0:]
+        n_times = len(slice_times)
 
-        result = {h: {'windspeed': [], 'winddirection': [], 'temperature': []} for h in heights}
+        def _get(key, ti):
+            arr = hourly.get(key, [])
+            v = arr[ti] if ti < len(arr) else None
+            return v
+
+        data = []
+
+        # 2m 所有时次（无风）
         for ti in range(idx0, idx0 + n_times):
-            zs, us, vs, ts = _build_single_profile(hourly, ti, elevation)
-            for h in heights:
-                ws, wd, temp = _interp_at_height(h, zs, us, vs, ts)
-                result[h]['windspeed'].append(ws)
-                result[h]['winddirection'].append(wd)
-                result[h]['temperature'].append(temp)
+            ft   = _om_forecast_time(slice_times[ti - idx0])
+            sfp  = _get('surface_pressure', ti)
+            cld  = _get('cloudcover', ti)
+            tem  = _get('temperature_2m', ti)
+            rain = _get('rain', ti)
+            snow = _get('snowfall', ti)
+            vis  = _get('visibility', ti)
+            rh   = _get('relativehumidity_2m', ti)
+            data.append({
+                "height": 2,
+                "sfp":    round(sfp, 2)  if sfp  is not None else -1,
+                "cld":    round(cld, 2)  if cld  is not None else -1,
+                "tem":    round(tem, 2)  if tem  is not None else -1,
+                "rain":   round(rain, 2) if rain is not None else -1,
+                "snow":   round(snow, 2) if snow is not None else -1,
+                "windS":  -1,
+                "windD":  -1,
+                "vis":    round(vis, 1)  if vis  is not None else -1,
+                "rh":     round(rh, 2)   if rh   is not None else -1,
+                "forecastTime": ft,
+            })
 
-        resp = {
-            "success":   True,
-            "lat":       snap_lat,
-            "lon":       snap_lon,
-            "elevation": elevation,
-            "heights":   heights,
-            "times":     times,
-            "count":     n_times,
-            "units":     {"windspeed": "m/s", "winddirection": "degrees", "temperature": "°C"},
-        }
+        # 预计算每个时次的气压剖面（用于 pres 插值）
+        pressure_profiles = []
+        for ti in range(idx0, idx0 + n_times):
+            pressure_profiles.append(_build_pressure_profile(hourly, ti, elevation))
+
+        # 10m 所有时次（含10m风）
+        for i, ti in enumerate(range(idx0, idx0 + n_times)):
+            ft   = _om_forecast_time(slice_times[i])
+            cld  = _get('cloudcover', ti)
+            tem  = _get('temperature_2m', ti)
+            rain = _get('rain', ti)
+            snow = _get('snowfall', ti)
+            vis  = _get('visibility', ti)
+            rh   = _get('relativehumidity_2m', ti)
+            ws10 = _get('windspeed_10m', ti)
+            wd10 = _get('winddirection_10m', ti)
+            hp, pp = pressure_profiles[i]
+            pres10 = _interp_pressure(10, hp, pp) or -1
+            data.append({
+                "height": 10,
+                "pres":   pres10,
+                "cld":    round(cld, 2)  if cld  is not None else -1,
+                "tem":    round(tem, 2)  if tem  is not None else -1,
+                "rain":   round(rain, 2) if rain is not None else -1,
+                "snow":   round(snow, 2) if snow is not None else -1,
+                "windS":  round(ws10, 2) if ws10 is not None else -1,
+                "windD":  round(wd10, 1) if wd10 is not None else -1,
+                "vis":    round(vis, 1)  if vis  is not None else -1,
+                "rh":     round(rh, 2)   if rh   is not None else -1,
+                "forecastTime": ft,
+            })
+
+        # 预计算每个时次的垂直剖面（避免重复计算）及地面降水
+        profiles     = []
+        surface_rain = []
+        surface_snow = []
+        rain_arr = hourly.get('rain') or []
+        snow_arr = hourly.get('snowfall') or []
+        for ti in range(idx0, idx0 + n_times):
+            profiles.append(_build_single_profile(hourly, ti, elevation))
+            surface_rain.append(rain_arr[ti] if ti < len(rain_arr) else None)
+            surface_snow.append(snow_arr[ti] if ti < len(snow_arr) else None)
+
+        # profile 高度层（height-major）：每个高度所有时次
         for h in heights:
-            key = f'h{int(h)}m' if h == int(h) else f'h{h}m'
-            resp[f'{key}_windspeed']     = result[h]['windspeed']
-            resp[f'{key}_winddirection'] = result[h]['winddirection']
-            resp[f'{key}_temperature']   = result[h]['temperature']
+            h_out = int(h) if h == int(h) else h
+            for i in range(n_times):
+                ft = _om_forecast_time(slice_times[i])
+                zs, us, vs, ts, rhs = profiles[i]
+                ws, wd, temp, rh = _interp_at_height(h, zs, us, vs, ts, rhs)
+                rain = surface_rain[i]
+                snow = surface_snow[i]
+                hp, pp = pressure_profiles[i]
+                pres = _interp_pressure(h, hp, pp) or -1
+                data.append({
+                    "height": h_out,
+                    "pres":   pres,
+                    "cld":    -1,
+                    "tem":    round(temp, 2) if temp is not None else -1,
+                    "rain":   round(rain, 2) if rain is not None else -1,
+                    "snow":   round(snow, 2) if snow is not None else -1,
+                    "windS":  ws if ws is not None else -1,
+                    "windD":  wd if wd is not None else -1,
+                    "vis":    -1,
+                    "rh":     rh if rh is not None else -1,
+                    "forecastTime": ft,
+                })
 
-        return jsonify(resp)
+        return jsonify({"code": 1000, "message": "成功", "data": data})
 
     except Exception as e:
         logger.error(f"openmeteo_profile 失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"code": 1001, "message": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

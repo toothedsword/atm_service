@@ -1,10 +1,11 @@
 #!/bin/bash
-# 垂直高度层剖面：北京 15层(100~30000m)风速/风向/温度时间序列
-# 等压面 geopotential_height 定位各层实际高度；缺失层用标准大气压高公式插值
-# 超出 30 hPa(≈23.8 km) 的高度(如 30000 m)用最近两层线性外推
-# 风速单位: m/s  温度单位: °C
+# 垂直高度层剖面接口
+# 固定返回 2m（无风）和 10m（含10m风）近地面层，再加指定高度层（风+温度）
+# 输出格式: {"code":1000, "message":"成功", "data":[{height,sfp,cld,tem,pre,windS,windD,vis,rh,forecastTime},...]}
+# 数据顺序: 2m所有时次 → 10m所有时次 → 各profile高度所有时次
+# 风速单位: m/s  温度: °C  气压: hPa  能见度: m  forecastTime: "YYYY-MM-DD HH:MM:SS"
 
-# 默认高度层（全部15层）
+# 默认高度层（全部15层 100~30000m）
 echo "=== 默认15层 (100~30000m) ==="
 curl -s -X POST http://localhost:5001/api/openmeteo_profile \
   -H "Content-Type: application/json" \
@@ -21,6 +22,6 @@ curl -s -X POST http://localhost:5001/api/openmeteo_profile \
     "lat": 40.0,
     "lon": 116.0,
     "heights": [100, 900, 3000, 7000, 10000],
-    "datetime": "2026050900",
+    "datetime": "2026051100",
     "forecast_days": 3
   }' | python3 -m json.tool
