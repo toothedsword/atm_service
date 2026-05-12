@@ -753,6 +753,16 @@ def _om_snap(val):
     return round(round(val / _OM_GRID_RES) * _OM_GRID_RES, 3)
 
 
+def _dew_point(T, RH):
+    """Magnus公式计算露点温度(°C)，T单位°C，RH单位%"""
+    import math
+    if T is None or RH is None or RH <= 0:
+        return None
+    a, b = 17.625, 243.04
+    alpha = math.log(RH / 100.0) + a * T / (b + T)
+    return round(b * alpha / (a - alpha), 2)
+
+
 def _om_save_last_pos(lat, lon):
     """记录最后访问的格点坐标及时间"""
     with open(_OM_LAST_POS_FILE, 'w') as f:
@@ -1214,7 +1224,7 @@ def openmeteo_profile():
         forecast_days int    预报天数，默认 7
 
     返回 JSON:
-        {code, message, data: [{height, sfp, cld, tem, pre, windS, windD, vis, rh, forecastTime}, ...]}
+        {code, message, data: [{height, sfp, cld, tem, dp, pre, windS, windD, vis, rh, forecastTime}, ...]}
 
     高度顺序: 2m (无风) → 10m (含10m风) → 各profile高度 (无地面量)
     """
@@ -1263,11 +1273,13 @@ def openmeteo_profile():
             snow = _get('snowfall', ti)
             vis  = _get('visibility', ti)
             rh   = _get('relativehumidity_2m', ti)
+            dp   = _dew_point(tem, rh)
             data.append({
                 "height": 2,
                 "sfp":    round(sfp, 2)  if sfp  is not None else -1,
                 "cld":    round(cld, 2)  if cld  is not None else -1,
                 "tem":    round(tem, 2)  if tem  is not None else -1,
+                "dp":     dp             if dp   is not None else -1,
                 "rain":   round(rain, 2) if rain is not None else -1,
                 "snow":   round(snow, 2) if snow is not None else -1,
                 "windS":  -1,
@@ -1295,11 +1307,13 @@ def openmeteo_profile():
             wd10 = _get('winddirection_10m', ti)
             hp, pp = pressure_profiles[i]
             pres10 = _interp_pressure(10, hp, pp) or -1
+            dp   = _dew_point(tem, rh)
             data.append({
                 "height": 10,
                 "pres":   pres10,
                 "cld":    round(cld, 2)  if cld  is not None else -1,
                 "tem":    round(tem, 2)  if tem  is not None else -1,
+                "dp":     dp             if dp   is not None else -1,
                 "rain":   round(rain, 2) if rain is not None else -1,
                 "snow":   round(snow, 2) if snow is not None else -1,
                 "windS":  round(ws10, 2) if ws10 is not None else -1,
@@ -1331,11 +1345,13 @@ def openmeteo_profile():
                 snow = surface_snow[i]
                 hp, pp = pressure_profiles[i]
                 pres = _interp_pressure(h, hp, pp) or -1
+                dp = _dew_point(temp, rh)
                 data.append({
                     "height": h_out,
                     "pres":   pres,
                     "cld":    -1,
                     "tem":    round(temp, 2) if temp is not None else -1,
+                    "dp":     dp             if dp   is not None else -1,
                     "rain":   round(rain, 2) if rain is not None else -1,
                     "snow":   round(snow, 2) if snow is not None else -1,
                     "windS":  ws if ws is not None else -1,
