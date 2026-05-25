@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+app.config['JSON_AS_ASCII'] = False
 
 ALLOWED_EXTENSIONS = {'txt', 'json'}
 TEMP_BASE = '/tmp/atm_service'
@@ -736,7 +737,7 @@ _OM_TARGET_HEIGHTS = [100, 600, 750, 900, 1500, 2000, 3000, 4200, 5500, 7000, 90
 # 等压面剖面所需变量（近地面 + 各等压面温度/风速/风向/位势高度/相对湿度）
 _OM_PROFILE_VARS = (
     ['temperature_2m', 'relativehumidity_2m', 'rain', 'snowfall',
-     'surface_pressure', 'cloudcover', 'visibility',
+     'surface_pressure', 'cloudcover', 'visibility', 'cape',
      'windspeed_10m',  'winddirection_10m',
      'windspeed_80m',  'winddirection_80m',
      'windspeed_120m', 'winddirection_120m',
@@ -761,6 +762,70 @@ def _dew_point(T, RH):
     a, b = 17.625, 243.04
     alpha = math.log(RH / 100.0) + a * T / (b + T)
     return round(b * alpha / (a - alpha), 2)
+
+
+def _infer_weather_code(tem, rain, snow, cld, vis, rh, ws10=None, cape=None):
+    """
+    根据近地面气象要素推算天气现象中文描述。
+    rain: mm/h  snow: cm/h  tem: °C  cld: %  vis: m  rh: %  ws10: m/s  cape: J/kg
+    """
+    rain = rain if (rain is not None and rain >= 0) else 0.0
+    snow = snow if (snow is not None and snow >= 0) else 0.0
+    cld  = cld  if cld  is not None else 0.0
+    vis  = vis  if (vis is not None and vis >= 0)  else 10000.0
+    rh   = rh   if rh   is not None else 60.0
+    tem  = tem  if tem  is not None else 15.0
+    ws10 = ws10 if ws10 is not None else 0.0
+    cape = cape if cape is not None else 0.0
+
+    has_rain = rain > 0.1   # mm/h，过滤痕量
+    has_snow = snow > 0.01  # cm/h，过滤痕量
+
+    # 冻雨：有雨但气温 ≤ 0°C
+    if has_rain and tem <= 0:
+        return '冻雨'
+
+    # 雨夹雪
+    if has_rain and has_snow:
+        return '雨夹雪'
+
+    # 纯降雪（open-meteo snowfall 单位 cm/h）
+    # 中国气象标准换算：暴雪≥10mm水当量/24h ≈ 0.4cm/h，大雪≥5mm≈0.2，中雪≥2.5mm≈0.1
+    if has_snow and not has_rain:
+        if snow >= 0.5:   return '暴雪'
+        elif snow >= 0.2: return '大雪'
+        elif snow >= 0.1: return '中雪'
+        else:             return '小雪'
+
+    # 纯降雨（rain 单位 mm/h，中国气象局小时雨强标准）
+    if has_rain and not has_snow:
+        # 雷暴判据：CAPE 显著 或 高温高湿强对流环境
+        thundery = (cape >= 500) or (tem >= 22 and rh >= 75 and cld >= 50)
+        if rain >= 80:    return '特大暴雨'
+        elif rain >= 40:  return '大暴雨'
+        elif rain >= 16:  return '暴雨'
+        elif rain >= 8:   return '大雨'
+        elif rain >= 2.5: return '雷阵雨' if thundery else '中雨'
+        else:             return '雷阵雨' if thundery else '小雨'
+
+    # 无降水 —— 沙尘（干燥 + 大风 + 低能见度）
+    if rh < 50 and ws10 >= 10:
+        if vis < 500:    return '强沙尘暴'
+        elif vis < 1000: return '沙尘暴'
+        elif vis < 8000: return '扬沙'
+
+    # 雾（高湿 + 极低能见度）
+    if vis < 1000 and rh >= 90:
+        return '雾'
+
+    # 霾（中低能见度 + 中高湿度，非雾非沙）
+    if vis < 5000 and 50 <= rh < 90:
+        return '霾'
+
+    # 晴/多云/阴
+    if cld >= 85:   return '阴'
+    elif cld >= 25: return '多云'
+    else:           return '晴'
 
 
 def _om_save_last_pos(lat, lon):
@@ -1224,7 +1289,7 @@ def openmeteo_profile():
         forecast_days int    预报天数，默认 7
 
     返回 JSON:
-        {code, message, data: [{height, sfp, cld, tem, dp, pre, windS, windD, vis, rh, forecastTime}, ...]}
+        {code, message, data: [{height, sfp, cld, tem, dp, pre, windS, windD, vis, rh, phenomenon(仅2m,中文), forecastTime}, ...]}
 
     高度顺序: 2m (无风) → 10m (含10m风) → 各profile高度 (无地面量)
     """
@@ -1273,7 +1338,10 @@ def openmeteo_profile():
             snow = _get('snowfall', ti)
             vis  = _get('visibility', ti)
             rh   = _get('relativehumidity_2m', ti)
+            ws10 = _get('windspeed_10m', ti)
+            cape = _get('cape', ti)
             dp   = _dew_point(tem, rh)
+            wx   = _infer_weather_code(tem, rain, snow, cld, vis, rh, ws10, cape)
             data.append({
                 "height": 2,
                 "sfp":    round(sfp, 2)  if sfp  is not None else -1,
@@ -1286,6 +1354,7 @@ def openmeteo_profile():
                 "windD":  -1,
                 "vis":    round(vis, 1)  if vis  is not None else -1,
                 "rh":     round(rh, 2)   if rh   is not None else -1,
+                "phenomenon": wx,
                 "forecastTime": ft,
             })
 

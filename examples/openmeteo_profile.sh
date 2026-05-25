@@ -1,7 +1,7 @@
 #!/bin/bash
 # 垂直高度层剖面接口
 # 固定返回 2m（无风）和 10m（含10m风）近地面层，再加指定高度层（风+温度）
-# 输出格式: {"code":1000, "message":"成功", "data":[{height,sfp,cld,tem,dp,pre,windS,windD,vis,rh,forecastTime},...]}
+# 输出格式: {"code":1000, "message":"成功", "data":[{height,sfp,cld,tem,dp,pre,windS,windD,vis,rh,phenomenon(仅2m),forecastTime},...]}
 # 数据顺序: 2m所有时次 → 10m所有时次 → 各profile高度所有时次
 # 风速单位: m/s  温度: °C  气压: hPa  能见度: m  forecastTime: "YYYY-MM-DD HH:MM:SS"
 
