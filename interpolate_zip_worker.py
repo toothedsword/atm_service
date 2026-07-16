@@ -16,6 +16,9 @@ import os
 from scipy.interpolate import RegularGridInterpolator
 import rasterio
 from rasterio.transform import from_bounds
+import argparse
+import tempfile
+import shutil
 
 
 # Configure logging
@@ -336,71 +339,206 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
     return output_path
 
 
-if __name__ == "__main__":
-    # Example usage and testing
-    logging.basicConfig(level=logging.INFO)
+def main():
+    """
+    Main entry point for ZIP to COG TIFF interpolation worker.
 
-    # Test with sample data if available
-    test_zip = "/home/leon/Downloads/atm_service/tmp/data/WRF_REAL_20260506000000_t_all_00000.zip"
+    Usage:
+        python3 interpolate_zip_worker.py --input <input.zip> --output <output.zip>
+
+    Reads a ZIP file containing binary atmospheric data, interpolates it to
+    higher resolution, and outputs all processed TIFF files in a ZIP archive.
+    """
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='ZIP to COG TIFF Interpolation Worker',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python3 interpolate_zip_worker.py --input data.zip --output result.zip
+  python3 interpolate_zip_worker.py --input /path/to/input.zip --output /path/to/output.zip
+        '''
+    )
+
+    parser.add_argument(
+        '--input',
+        type=str,
+        required=True,
+        help='Path to input ZIP file containing atmospheric data'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        required=True,
+        help='Path to output ZIP file for processed TIFF files'
+    )
+
+    args = parser.parse_args()
+
+    input_zip = args.input
+    output_zip = args.output
+
+    logger.info("=" * 60)
+    logger.info("ZIP to COG TIFF Interpolation Worker")
+    logger.info("=" * 60)
+    logger.info(f"Input ZIP: {input_zip}")
+    logger.info(f"Output ZIP: {output_zip}")
+
+    # Validate input file
+    if not os.path.exists(input_zip):
+        logger.error(f"Input file not found: {input_zip}")
+        return 1
+
+    # Create temporary directory for processing
+    temp_dir = tempfile.mkdtemp(prefix='interpolate_worker_')
+    logger.info(f"Created temporary directory: {temp_dir}")
 
     try:
-        header, data_4d, lon_array, lat_array = read_zip_data(test_zip)
-        print(f"\nSuccessfully read ZIP data!")
-        print(f"Header metadata: {list(header.keys())}")
-        print(f"Data 4D shape: {data_4d.shape}")
-        print(f"Lon array shape: {lon_array.shape}, range: [{lon_array.min():.4f}, {lon_array.max():.4f}]")
-        print(f"Lat array shape: {lat_array.shape}, range: [{lat_array.min():.4f}, {lat_array.max():.4f}]")
-
-        # Test interpolate_and_save_tif with first time and level
-        print("\n" + "=" * 60)
-        print("Testing interpolate_and_save_tif...")
-        print("=" * 60)
-
-        # Extract first time and level
-        data_2d = data_4d[0, 0, :, :]  # First time, first level
-        time_str = header.get('timeList', ['00000'])[0]
-        level_str = header.get('levelList', ['1000'])[0]
-
-        # Create output directory
-        output_dir = "/tmp/atm_service_test"
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Generate output path
-        output_tiff = os.path.join(output_dir, f"test_t{time_str}_lv{level_str}.tif")
-
-        # Call interpolate_and_save_tif
-        result_path = interpolate_and_save_tif(
-            data_2d, lon_array, lat_array,
-            time_str, level_str,
-            output_tiff
-        )
-
-        print(f"\nTIFF file generated: {result_path}")
-        print(f"File size: {os.path.getsize(result_path) / (1024*1024):.2f} MB")
-
-        # Verify with rasterio
-        print("\nVerifying TIFF file...")
-        with rasterio.open(result_path) as src:
-            print(f"  Shape: ({src.height}, {src.width})")
-            print(f"  Data type: {src.dtypes[0]}")
-            print(f"  CRS: {src.crs}")
-            print(f"  NODATA value: {src.nodata}")
-            print(f"  Transform: {src.transform}")
-            data_sample = src.read(1)
-            print(f"  Data range: [{np.nanmin(data_sample)}, {np.nanmax(data_sample)}]")
-            print(f"  Data statistics: min={np.nanmin(data_sample)}, max={np.nanmax(data_sample)}, mean={np.nanmean(data_sample):.2f}")
-
-        # Try to get gdalinfo output if available
-        print("\n" + "=" * 60)
-        print("GDAL Info:")
-        print("=" * 60)
+        # Read ZIP data
+        logger.info("Step 1: Reading input ZIP data...")
         try:
-            result = subprocess.run(['gdalinfo', result_path], capture_output=True, text=True, timeout=10)
-            print(result.stdout)
+            header, data_4d, lon_array, lat_array = read_zip_data(input_zip)
         except Exception as e:
-            print(f"Could not run gdalinfo: {e}")
+            logger.error(f"Failed to read input ZIP: {e}")
+            return 1
+
+        logger.info(f"Successfully read ZIP data!")
+        logger.info(f"  Metadata keys: {list(header.keys())}")
+        logger.info(f"  Data 4D shape: {data_4d.shape}")
+        logger.info(f"  Time list: {header.get('timeList', [])}")
+        logger.info(f"  Level list: {header.get('levelList', [])}")
+
+        # Get time and level information
+        time_list = header.get('timeList', [])
+        level_list = header.get('levelList', [])
+
+        if not time_list or not level_list:
+            logger.error("Missing timeList or levelList in header")
+            return 1
+
+        num_times = len(time_list)
+        num_levels = len(level_list)
+        total_combinations = num_times * num_levels
+
+        logger.info(f"Processing {total_combinations} combinations ({num_times} times × {num_levels} levels)")
+
+        # Create output directory for TIFF files
+        tiff_output_dir = os.path.join(temp_dir, 'tiffs')
+        os.makedirs(tiff_output_dir, exist_ok=True)
+
+        # Step 2: Process each time/level combination
+        logger.info("Step 2: Processing time/level combinations...")
+        processed_count = 0
+        failed_combinations = []
+
+        for time_idx, time_str in enumerate(time_list):
+            for level_idx, level_str in enumerate(level_list):
+                combination_num = time_idx * num_levels + level_idx + 1
+                logger.info(f"Processing {combination_num}/{total_combinations}: time={time_str}, level={level_str}")
+
+                try:
+                    # Extract 2D data slice
+                    data_2d = data_4d[time_idx, level_idx, :, :]
+
+                    # Check for all NaN data
+                    if np.isnan(data_2d).all():
+                        logger.warning(f"  All data is NaN, skipping")
+                        failed_combinations.append((time_str, level_str, "All NaN data"))
+                        continue
+
+                    # Generate output TIFF filename
+                    tiff_filename = f"t_{time_str}_{level_str}.tif"
+                    tiff_output_path = os.path.join(tiff_output_dir, tiff_filename)
+
+                    # Interpolate and save
+                    result_path = interpolate_and_save_tif(
+                        data_2d, lon_array, lat_array,
+                        time_str, level_str,
+                        tiff_output_path
+                    )
+
+                    logger.info(f"  ✓ Successfully processed: {tiff_filename}")
+                    processed_count += 1
+
+                except Exception as e:
+                    logger.error(f"  ✗ Failed to process time={time_str}, level={level_str}: {e}")
+                    failed_combinations.append((time_str, level_str, str(e)))
+                    continue
+
+        # Log summary of failures
+        if failed_combinations:
+            logger.warning(f"Failed to process {len(failed_combinations)} combinations:")
+            for time_str, level_str, reason in failed_combinations:
+                logger.warning(f"  - time={time_str}, level={level_str}: {reason}")
+
+        logger.info(f"Successfully processed {processed_count}/{total_combinations} combinations")
+
+        if processed_count == 0:
+            logger.error("No combinations were successfully processed!")
+            return 1
+
+        # Step 3: Create output ZIP with all TIFF files
+        logger.info("Step 3: Creating output ZIP file...")
+
+        try:
+            # Create output directory if it doesn't exist
+            output_dir = os.path.dirname(output_zip)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            # Create ZIP file with all TIFF files
+            logger.info(f"Creating ZIP archive: {output_zip}")
+            with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                tiff_files = sorted([f for f in os.listdir(tiff_output_dir) if f.endswith('.tif')])
+                logger.info(f"Adding {len(tiff_files)} TIFF files to ZIP...")
+
+                for tiff_file in tiff_files:
+                    tiff_path = os.path.join(tiff_output_dir, tiff_file)
+                    file_size = os.path.getsize(tiff_path)
+                    logger.info(f"  Adding {tiff_file} ({file_size / (1024*1024):.2f} MB)")
+                    zf.write(tiff_path, arcname=tiff_file)
+
+            # Verify output ZIP
+            logger.info(f"Verifying output ZIP file...")
+            with zipfile.ZipFile(output_zip, 'r') as zf:
+                files_in_zip = zf.namelist()
+                total_size = sum(zf.getinfo(f).file_size for f in files_in_zip)
+                logger.info(f"  ✓ ZIP contains {len(files_in_zip)} files")
+                logger.info(f"  ✓ Total uncompressed size: {total_size / (1024*1024):.2f} MB")
+                logger.info(f"  ✓ ZIP file size: {os.path.getsize(output_zip) / (1024*1024):.2f} MB")
+
+        except Exception as e:
+            logger.error(f"Failed to create output ZIP: {e}")
+            return 1
+
+        logger.info("=" * 60)
+        logger.info("Successfully completed interpolation workflow!")
+        logger.info(f"Output ZIP: {output_zip}")
+        logger.info("=" * 60)
+
+        return 0
 
     except Exception as e:
-        import traceback
-        print(f"Error: {type(e).__name__}: {e}")
-        traceback.print_exc()
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return 1
+
+    finally:
+        # Clean up temporary directory
+        if os.path.exists(temp_dir):
+            logger.info(f"Cleaning up temporary directory: {temp_dir}")
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info("Temporary directory removed successfully")
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary directory: {e}")
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
