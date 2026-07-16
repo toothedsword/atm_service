@@ -185,8 +185,8 @@ EC_DATA_DIR = os.environ.get('EC_DATA_DIR', '/home/leon/Downloads/ec-oper-fc')
 def get_service_info():
     return jsonify({
         "service": "atm-service",
-        "version": "3.1.0",
-        "description": "大气数据处理服务：格式转换 + PPI绘图 + 航迹剖面图 + EC预报提取",
+        "version": "3.2.0",
+        "description": "大气数据处理服务：格式转换 + PPI绘图 + 航迹剖面图 + EC预报提取 + ZIP插值",
         "endpoints": {
             "/health":              "健康检查",
             "/api/info":            "服务信息",
@@ -206,10 +206,12 @@ def get_service_info():
             "/api/ppi_latest":     "激光雷达PPI最新完整圈 径向风速 PNG+TIF -> ZIP",
             "/api/ppi_vad_latest": "激光雷达PPI最新完整圈 VAD反演风场 PNG+TIF -> ZIP",
             "/api/wrf_slice":      "WRF模式数据剖面图（温湿/风切/垂直速度/云水）-> PNG或ZIP",
+            "/api/interpolate-zip-to-cogtiff": "WRF/气象数据 ZIP → COG TIFF（多时次多层次插值）",
         },
         "workers": ["converter_worker.py", "plot_worker.py", "slice_worker.py",
                     "ec_worker.py", "ec_point_worker.py", "cache.py",
-                    "ppi_worker.py", "ppi_vad_worker.py", "wrf_slice_worker.py"],
+                    "ppi_worker.py", "ppi_vad_worker.py", "wrf_slice_worker.py",
+                    "interpolate_zip_worker.py"],
         "max_file_size": "100MB",
     })
 
@@ -1639,6 +1641,105 @@ def wrf_slice():
     finally:
         cleanup_later(config_file, output_dir,
                       *([] if zip_file is None else [zip_file]))
+
+
+# ---------------------------------------------------------------------------
+# ZIP to COG TIFF 插值（通过 interpolate_zip_worker.py 子进程处理）
+# ---------------------------------------------------------------------------
+
+@app.route('/api/interpolate-zip-to-cogtiff', methods=['POST'])
+def interpolate_zip_to_cogtiff():
+    """
+    将 WRF/气象数据 ZIP 插值为 COG TIFF。
+
+    输入：
+    - file: ZIP 文件（multipart/form-data 上传）
+      - ZIP 内应包含 data.bin（包含多时次多层次数据）
+
+    输出：
+    - application/zip：结果 ZIP 文件，内含所有生成的 GeoTIFF 文件
+      - 文件命名：t_{time}_{level}.tif
+
+    示例：
+    ```
+    curl -X POST -F "file=@input.zip" http://localhost:5001/api/interpolate-zip-to-cogtiff \
+      -o result.zip
+    ```
+    """
+    task_id = str(uuid.uuid4())
+    input_file = None
+    output_file = None
+
+    try:
+        # 检查文件上传
+        if 'file' not in request.files:
+            return jsonify({"success": False, "error": "未提供文件"}), 400
+
+        file = request.files['file']
+        if not file.filename:
+            return jsonify({"success": False, "error": "文件名为空"}), 400
+
+        # 检查文件扩展名
+        if not file.filename.lower().endswith('.zip'):
+            return jsonify({"success": False, "error": "只接受 .zip 格式文件"}), 400
+
+        # 保存上传文件
+        input_file = os.path.join(TEMP_BASE, f'{task_id}_input.zip')
+        file.save(input_file)
+        logger.info(f"已保存上传文件: {input_file}")
+
+        # 准备输出文件
+        output_file = os.path.join(TEMP_BASE, f'{task_id}_output.zip')
+
+        # 调用 worker 子进程
+        cmd = [
+            'python3',
+            os.path.join(SERVICE_DIR, 'interpolate_zip_worker.py'),
+            '--input', input_file,
+            '--output', output_file
+        ]
+
+        rc, stdout, stderr = run_worker(cmd, timeout=3600)  # 1小时超时
+
+        if rc != 0:
+            return jsonify({
+                "success": False,
+                "error": f"插值处理失败: {stderr}"
+            }), 500
+
+        if not os.path.exists(output_file):
+            return jsonify({
+                "success": False,
+                "error": "未生成输出文件"
+            }), 500
+
+        # 返回结果文件
+        filename = os.path.splitext(secure_filename(file.filename))[0]
+        response = send_file(
+            output_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'{filename}_cogtiff.zip'
+        )
+
+        logger.info(f"✓ 插值完成: {output_file}")
+        return response
+
+    except Exception as e:
+        logger.error(f"interpolate-zip-to-cogtiff 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": f"服务错误: {str(e)}"
+        }), 500
+
+    finally:
+        # 延迟清理临时文件
+        if input_file:
+            cleanup_later(input_file)
+        if output_file:
+            cleanup_later(output_file)
 
 
 # ---------------------------------------------------------------------------
