@@ -468,10 +468,294 @@ def save_wind_cogtiff(u_2d, v_2d, lon, lat, time_str, level_str, output_path):
     return output_path
 
 
+def process_timestep(time_idx, time_str, level_idx, level_str, u_4d, v_4d, lon_array, lat_array, tiff_output_dir):
+    """
+    独立处理单个时间/层次组合的函数，用于并行执行。
+
+    Parameters:
+    -----------
+    time_idx, level_idx : int
+        时间/层次索引
+    time_str, level_str : str
+        时间/层次标识符（来自 timeList/levelList）
+    u_4d, v_4d : np.ndarray
+        完整的 4D U/V 风分量数组，形状 (times, levels, ySize, xSize)
+    lon_array, lat_array : np.ndarray
+        坐标数组
+    tiff_output_dir : str
+        输出目录
+
+    Returns:
+    --------
+    tuple (success, filename, error_message)
+    """
+    try:
+        u_2d = u_4d[time_idx, level_idx, :, :]
+        v_2d = v_4d[time_idx, level_idx, :, :]
+
+        if np.isnan(u_2d).all() or np.isnan(v_2d).all():
+            return False, f"wind_{time_str}_{level_str}.tif", "All NaN data"
+
+        tiff_filename = f"wind_{time_str}_{level_str}.tif"
+        tiff_output_path = os.path.join(tiff_output_dir, tiff_filename)
+
+        save_wind_cogtiff(u_2d, v_2d, lon_array, lat_array, time_str, level_str, tiff_output_path)
+        return True, tiff_filename, None
+    except Exception as e:
+        return False, f"wind_{time_str}_{level_str}.tif", str(e)
+
+
 def main():
-    """Main entry point."""
-    # TODO: Implement in Task 3
-    pass
+    """
+    Main entry point for Wind Speed & Direction COG TIFF Worker.
+
+    Usage:
+        python3 wind_cogtiff_worker.py --u-input <u10.zip> --v-input <v10.zip> --output <output.zip>
+
+    Reads U10/V10 wind component ZIPs, computes wind speed & direction for
+    every time/level combination, and writes all resulting multi-band COG
+    TIFF files into a single output ZIP archive.
+    """
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Wind Speed & Direction COG TIFF Worker',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python3 wind_cogtiff_worker.py --u-input u10.zip --v-input v10.zip --output wind.zip
+  python3 wind_cogtiff_worker.py --u-input /path/to/u10.zip --v-input /path/to/v10.zip --output /path/to/wind.zip
+        '''
+    )
+
+    parser.add_argument(
+        '--u-input',
+        type=str,
+        required=True,
+        help='Path to input ZIP file containing U10 wind component data'
+    )
+    parser.add_argument(
+        '--v-input',
+        type=str,
+        required=True,
+        help='Path to input ZIP file containing V10 wind component data'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        required=True,
+        help='Path to output ZIP file for processed wind TIFF files'
+    )
+
+    args = parser.parse_args()
+
+    u_input_zip = args.u_input
+    v_input_zip = args.v_input
+    output_zip = args.output
+
+    logger.info("=" * 60)
+    logger.info("Wind Speed & Direction COG TIFF Worker")
+    logger.info("=" * 60)
+    logger.info(f"U10 Input ZIP: {u_input_zip}")
+    logger.info(f"V10 Input ZIP: {v_input_zip}")
+    logger.info(f"Output ZIP: {output_zip}")
+
+    # Validate input files
+    if not os.path.exists(u_input_zip):
+        logger.error(f"U10 input file not found: {u_input_zip}")
+        return 1
+    if not os.path.exists(v_input_zip):
+        logger.error(f"V10 input file not found: {v_input_zip}")
+        return 1
+
+    # Create temporary directory for processing
+    temp_dir = tempfile.mkdtemp(prefix='wind_cogtiff_worker_')
+    logger.info(f"Created temporary directory: {temp_dir}")
+
+    overall_timer = Timer("OVERALL EXECUTION")
+    overall_timer.__enter__()
+
+    try:
+        # Step 1: Read both ZIP files
+        logger.info("Step 1: Reading U10/V10 input ZIP data...")
+        try:
+            with Timer("read_zip_data[u10]"):
+                u_header, u_4d, u_lon_array, u_lat_array = read_zip_data(u_input_zip)
+            with Timer("read_zip_data[v10]"):
+                v_header, v_4d, v_lon_array, v_lat_array = read_zip_data(v_input_zip)
+        except Exception as e:
+            logger.error(f"Failed to read input ZIP(s): {e}")
+            return 1
+
+        logger.info("Successfully read U10/V10 ZIP data!")
+        logger.info(f"  U10 data 4D shape: {u_4d.shape}")
+        logger.info(f"  V10 data 4D shape: {v_4d.shape}")
+
+        # Step 2: Validate consistency between U10 and V10
+        logger.info("Step 2: Validating U10/V10 metadata consistency...")
+
+        if u_4d.shape != v_4d.shape:
+            logger.error(
+                f"U10/V10 shape mismatch: u_4d.shape={u_4d.shape}, v_4d.shape={v_4d.shape}"
+            )
+            return 1
+
+        if not np.allclose(u_lon_array, v_lon_array):
+            logger.error("U10/V10 longitude coordinates do not match")
+            return 1
+
+        if not np.allclose(u_lat_array, v_lat_array):
+            logger.error("U10/V10 latitude coordinates do not match")
+            return 1
+
+        logger.info("U10/V10 metadata consistency verified")
+
+        # Get time and level information (from u_header; v_header should be consistent)
+        time_list = u_header.get('timeList', [])
+        level_list = u_header.get('levelList', [])
+
+        if not time_list or not level_list:
+            logger.error("Missing timeList or levelList in header")
+            return 1
+
+        num_times = len(time_list)
+        num_levels = len(level_list)
+        total_combinations = num_times * num_levels
+
+        logger.info(f"Processing {total_combinations} combinations ({num_times} times × {num_levels} levels)")
+
+        # Create output directory for TIFF files
+        tiff_output_dir = os.path.join(temp_dir, 'tiffs')
+        os.makedirs(tiff_output_dir, exist_ok=True)
+
+        # Step 3: Process each time/level combination (parallel)
+        logger.info("Step 3: Processing time/level combinations (parallel)...")
+        processed_count = 0
+        failed_combinations = []
+        step3_timer = Timer("Step 3 - All processing")
+        step3_timer.__enter__()
+
+        # Determine number of workers (quarter of available cores, for an
+        # 8-core system this yields 2 workers). Using ThreadPoolExecutor
+        # instead of ProcessPoolExecutor to avoid u/v array serialization
+        # overhead across process boundaries.
+        max_cores = os.cpu_count() or 1
+        num_workers = max(1, max_cores // 4)
+        logger.info(f"Using {num_workers} parallel workers (out of {max_cores} cores)")
+
+        # Create list of tasks
+        tasks = []
+        for time_idx, time_str in enumerate(time_list):
+            for level_idx, level_str in enumerate(level_list):
+                tasks.append((time_idx, time_str, level_idx, level_str))
+
+        # Execute tasks in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(
+                    process_timestep,
+                    time_idx, time_str, level_idx, level_str,
+                    u_4d, v_4d, u_lon_array, u_lat_array, tiff_output_dir
+                ): (time_idx, time_str, level_idx, level_str)
+                for time_idx, time_str, level_idx, level_str in tasks
+            }
+
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                time_idx, time_str, level_idx, level_str = futures[future]
+
+                try:
+                    success, tiff_filename, error_msg = future.result()
+                    if success:
+                        logger.info(f"  [{completed}/{total_combinations}] ✓ {tiff_filename}")
+                        processed_count += 1
+                    else:
+                        logger.error(f"  [{completed}/{total_combinations}] ✗ {tiff_filename}: {error_msg}")
+                        failed_combinations.append((time_str, level_str, error_msg))
+                except Exception as e:
+                    logger.error(f"  [{completed}/{total_combinations}] ✗ time={time_str}, level={level_str}: {e}")
+                    failed_combinations.append((time_str, level_str, str(e)))
+
+        step3_timer.__exit__(None, None, None)
+
+        # Log summary of failures
+        if failed_combinations:
+            logger.warning(f"Failed to process {len(failed_combinations)} combinations:")
+            for time_str, level_str, reason in failed_combinations:
+                logger.warning(f"  - time={time_str}, level={level_str}: {reason}")
+
+        logger.info(f"Successfully processed {processed_count}/{total_combinations} combinations")
+
+        if processed_count == 0:
+            logger.error("No combinations were successfully processed!")
+            return 1
+
+        # Step 4: Create output ZIP with all TIFF files
+        logger.info("Step 4: Creating output ZIP file...")
+
+        try:
+            # Create output directory if it doesn't exist
+            output_dir = os.path.dirname(output_zip)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            # Create ZIP file with all TIFF files
+            logger.info(f"Creating ZIP archive: {output_zip}")
+            with Timer("Step 4 - Create ZIP"):
+                with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    tiff_files = sorted([f for f in os.listdir(tiff_output_dir) if f.endswith('.tif')])
+                    logger.info(f"Adding {len(tiff_files)} TIFF files to ZIP...")
+
+                    for tiff_file in tiff_files:
+                        tiff_path = os.path.join(tiff_output_dir, tiff_file)
+                        file_size = os.path.getsize(tiff_path)
+                        logger.info(f"  Adding {tiff_file} ({file_size / (1024*1024):.2f} MB)")
+                        zf.write(tiff_path, arcname=tiff_file)
+
+            # Verify output ZIP
+            logger.info("Verifying output ZIP file...")
+            with Timer("Step 4 - Verify ZIP"):
+                with zipfile.ZipFile(output_zip, 'r') as zf:
+                    files_in_zip = zf.namelist()
+                    total_size = sum(zf.getinfo(f).file_size for f in files_in_zip)
+                    logger.info(f"  ✓ ZIP contains {len(files_in_zip)} files")
+                    logger.info(f"  ✓ Total uncompressed size: {total_size / (1024*1024):.2f} MB")
+                    logger.info(f"  ✓ ZIP file size: {os.path.getsize(output_zip) / (1024*1024):.2f} MB")
+
+        except Exception as e:
+            logger.error(f"Failed to create output ZIP: {e}")
+            return 1
+
+        logger.info("=" * 60)
+        logger.info("Successfully completed wind COG TIFF workflow!")
+        logger.info(f"Output ZIP: {output_zip}")
+        logger.info("=" * 60)
+
+        overall_timer.__exit__(None, None, None)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        overall_timer.__exit__(None, None, None)
+        return 1
+
+    finally:
+        # Clean up temporary directory
+        if os.path.exists(temp_dir):
+            logger.info(f"Cleaning up temporary directory: {temp_dir}")
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info("Temporary directory removed successfully")
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary directory: {e}")
 
 
 if __name__ == "__main__":
