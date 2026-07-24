@@ -19,10 +19,26 @@ from rasterio.transform import from_bounds
 import argparse
 import tempfile
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Timing helper
+class Timer:
+    def __init__(self, name):
+        self.name = name
+        self.start = time.time()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        elapsed = time.time() - self.start
+        logger.info(f"⏱ {self.name}: {elapsed:.2f}s")
 
 
 def read_zip_data(zip_path: str) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
@@ -53,20 +69,25 @@ def read_zip_data(zip_path: str) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarr
     """
     logger.info(f"Reading ZIP file: {zip_path}")
 
-    # Open ZIP file and extract data.bin
+    # Open ZIP file and extract binary data file
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            # Check if data.bin exists in ZIP
-            if 'data.bin' not in zf.namelist():
-                raise FileNotFoundError(f"data.bin not found in {zip_path}")
+            # Find binary data file (any file that's not data.bin specifically, but first non-dir file)
+            files = [f for f in zf.namelist() if not f.endswith('/')]
+            if not files:
+                raise FileNotFoundError(f"No files found in {zip_path}")
 
-            # Extract data.bin to memory
-            with zf.open('data.bin') as f:
+            # Prefer data.bin if it exists, otherwise use first file
+            data_filename = 'data.bin' if 'data.bin' in files else files[0]
+            logger.info(f"Reading file from ZIP: {data_filename}")
+
+            # Extract data file to memory
+            with zf.open(data_filename) as f:
                 data_bytes = f.read()
     except zipfile.BadZipFile as e:
         raise FileNotFoundError(f"Invalid ZIP file: {zip_path}") from e
 
-    logger.info(f"Extracted data.bin: {len(data_bytes)} bytes")
+    logger.info(f"Extracted {data_filename}: {len(data_bytes)} bytes")
 
     # Parse binary format
     # First 4 bytes: little-endian unsigned int (header length)
@@ -155,6 +176,37 @@ def read_zip_data(zip_path: str) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarr
     return header, data_4d, lon_array, lat_array
 
 
+def process_timestep(time_idx, time_str, level_idx, level_str, data_4d, lon_array, lat_array, tiff_output_dir):
+    """
+    独立处理单个时间步长的函数，用于并行执行。
+
+    Parameters:
+    -----------
+    time_idx, level_idx: 时间/层级索引
+    time_str, level_str: 时间/层级标识符
+    data_4d: 完整的4D数据数组
+    lon_array, lat_array: 坐标数组
+    tiff_output_dir: 输出目录
+
+    Returns:
+    --------
+    tuple (success, filename, error_message)
+    """
+    try:
+        data_2d = data_4d[time_idx, level_idx, :, :]
+
+        if np.isnan(data_2d).all():
+            return False, f"t_{time_str}_{level_str}.tif", "All NaN data"
+
+        tiff_filename = f"t_{time_str}_{level_str}.tif"
+        tiff_output_path = os.path.join(tiff_output_dir, tiff_filename)
+
+        interpolate_and_save_tif(data_2d, lon_array, lat_array, time_str, level_str, tiff_output_path)
+        return True, tiff_filename, None
+    except Exception as e:
+        return False, f"t_{time_str}_{level_str}.tif", str(e)
+
+
 def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path):
     """
     将 2D 数据插值到更高分辨率并保存为 COG TIFF。
@@ -210,16 +262,17 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
 
     # Create interpolator
     # RegularGridInterpolator expects coordinates in increasing order
-    interpolator = RegularGridInterpolator(
-        (lat, lon),  # (y, x) order for 2D array
-        data_2d,
-        method='linear',
-        bounds_error=False,
-        fill_value=np.nan
-    )
+    with Timer(f"    create_interpolator[{level_str}]"):
+        interpolator = RegularGridInterpolator(
+            (lat, lon),  # (y, x) order for 2D array
+            data_2d,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan
+        )
 
-    # Define target grid with 0.001° resolution
-    target_resolution = 0.001
+    # Define target grid with 0.002° resolution
+    target_resolution = 0.002
     lon_min, lon_max = lon.min(), lon.max()
     lat_min, lat_max = lat.min(), lat.max()
 
@@ -233,10 +286,11 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
     )
 
     # Create meshgrid and interpolate
-    lon_grid, lat_grid = np.meshgrid(target_lon, target_lat)
-    points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
-    interpolated_flat = interpolator(points)
-    interpolated_data = interpolated_flat.reshape(lat_grid.shape)
+    with Timer(f"    meshgrid_and_interpolate[{level_str}]"):
+        lon_grid, lat_grid = np.meshgrid(target_lon, target_lat)
+        points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
+        interpolated_flat = interpolator(points)
+        interpolated_data = interpolated_flat.reshape(lat_grid.shape)
 
     logger.info(
         f"Interpolated data: shape={interpolated_data.shape}, "
@@ -267,29 +321,32 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
 
     # Write GeoTIFF with COG settings
     try:
-        with rasterio.open(
-            output_path,
-            'w',
-            driver='GTiff',
-            height=interpolated_int16.shape[0],
-            width=interpolated_int16.shape[1],
-            count=1,
-            dtype=interpolated_int16.dtype,
-            crs='EPSG:4326',
-            transform=transform,
-            nodata=nodata_value,
-            compress='deflate',
-            tiled=True,
-            blockxsize=512,
-            blockysize=512,
-            BIGTIFF='NO'
-        ) as dst:
-            dst.write(interpolated_int16, 1)
-            # Write statistics
-            dst.update_tags(1, STATISTICS_MINIMUM=str(interpolated_int16[valid_mask].min()),
-                           STATISTICS_MAXIMUM=str(interpolated_int16[valid_mask].max()),
-                           STATISTICS_MEAN=str(interpolated_int16[valid_mask].mean()),
-                           STATISTICS_STDDEV=str(interpolated_int16[valid_mask].std()))
+        with Timer(f"    write_geotiff[{level_str}]"):
+            with rasterio.open(
+                output_path,
+                'w',
+                driver='GTiff',
+                height=interpolated_int16.shape[0],
+                width=interpolated_int16.shape[1],
+                count=1,
+                dtype=interpolated_int16.dtype,
+                crs='EPSG:4326',
+                transform=transform,
+                nodata=nodata_value,
+                compress='deflate',
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                BIGTIFF='NO',
+                PREDICTOR=2
+            ) as dst:
+                dst.write(interpolated_int16, 1)
+                # Add description and write statistics
+                dst.update_tags(1, description=f'{level_str} (×10, divide by 10 to get original value)')
+                dst.update_tags(1, STATISTICS_MINIMUM=str(interpolated_int16[valid_mask].min()),
+                               STATISTICS_MAXIMUM=str(interpolated_int16[valid_mask].max()),
+                               STATISTICS_MEAN=str(interpolated_int16[valid_mask].mean()),
+                               STATISTICS_STDDEV=str(interpolated_int16[valid_mask].std()))
     except Exception as e:
         raise ValueError(f"Failed to write GeoTIFF: {str(e)}") from e
 
@@ -307,7 +364,8 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
         ]
 
         logger.info(f"Building pyramids: {' '.join(gdal_cmd)}")
-        subprocess.run(gdal_cmd, check=True, capture_output=True, text=True)
+        with Timer(f"    gdaladdo[{level_str}]"):
+            subprocess.run(gdal_cmd, check=True, capture_output=True, text=True)
         logger.info(f"Pyramids built successfully")
 
     except subprocess.CalledProcessError as e:
@@ -335,6 +393,9 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
             )
     except Exception as e:
         raise ValueError(f"Failed to verify GeoTIFF: {str(e)}") from e
+
+    # Explicitly free large temporary arrays to reduce memory pressure
+    gc.collect()
 
     return output_path
 
@@ -399,11 +460,15 @@ Examples:
     temp_dir = tempfile.mkdtemp(prefix='interpolate_worker_')
     logger.info(f"Created temporary directory: {temp_dir}")
 
+    overall_timer = Timer("OVERALL EXECUTION")
+    overall_timer.__enter__()
+
     try:
         # Read ZIP data
         logger.info("Step 1: Reading input ZIP data...")
         try:
-            header, data_4d, lon_array, lat_array = read_zip_data(input_zip)
+            with Timer("read_zip_data"):
+                header, data_4d, lon_array, lat_array = read_zip_data(input_zip)
         except Exception as e:
             logger.error(f"Failed to read input ZIP: {e}")
             return 1
@@ -432,44 +497,58 @@ Examples:
         tiff_output_dir = os.path.join(temp_dir, 'tiffs')
         os.makedirs(tiff_output_dir, exist_ok=True)
 
-        # Step 2: Process each time/level combination
-        logger.info("Step 2: Processing time/level combinations...")
+        # Step 2: Process each time/level combination (parallel)
+        logger.info("Step 2: Processing time/level combinations (parallel)...")
         processed_count = 0
         failed_combinations = []
+        step2_timer = Timer("Step 2 - All processing")
+        step2_timer.__enter__()
 
+        # Determine number of workers (use quarter of available cores to avoid memory pressure)
+        # Each worker allocates ~500MB+ during meshgrid/interpolate phase
+        # Using ThreadPoolExecutor instead of ProcessPoolExecutor to avoid data serialization overhead
+        max_cores = os.cpu_count() or 1
+        num_workers = max(1, max_cores // 4)
+        logger.info(f"Using {num_workers} parallel workers (out of {max_cores} cores)")
+
+        # Create list of tasks
+        tasks = []
         for time_idx, time_str in enumerate(time_list):
             for level_idx, level_str in enumerate(level_list):
+                tasks.append((time_idx, time_str, level_idx, level_str))
+
+        # Execute tasks in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(
+                    process_timestep,
+                    time_idx, time_str, level_idx, level_str,
+                    data_4d, lon_array, lat_array, tiff_output_dir
+                ): (time_idx, time_str, level_idx, level_str)
+                for time_idx, time_str, level_idx, level_str in tasks
+            }
+
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                time_idx, time_str, level_idx, level_str = futures[future]
                 combination_num = time_idx * num_levels + level_idx + 1
-                logger.info(f"Processing {combination_num}/{total_combinations}: time={time_str}, level={level_str}")
 
                 try:
-                    # Extract 2D data slice
-                    data_2d = data_4d[time_idx, level_idx, :, :]
-
-                    # Check for all NaN data
-                    if np.isnan(data_2d).all():
-                        logger.warning(f"  All data is NaN, skipping")
-                        failed_combinations.append((time_str, level_str, "All NaN data"))
-                        continue
-
-                    # Generate output TIFF filename
-                    tiff_filename = f"t_{time_str}_{level_str}.tif"
-                    tiff_output_path = os.path.join(tiff_output_dir, tiff_filename)
-
-                    # Interpolate and save
-                    result_path = interpolate_and_save_tif(
-                        data_2d, lon_array, lat_array,
-                        time_str, level_str,
-                        tiff_output_path
-                    )
-
-                    logger.info(f"  ✓ Successfully processed: {tiff_filename}")
-                    processed_count += 1
-
+                    success, tiff_filename, error_msg = future.result()
+                    if success:
+                        logger.info(f"  [{completed}/{total_combinations}] ✓ {tiff_filename}")
+                        processed_count += 1
+                    else:
+                        logger.error(f"  [{completed}/{total_combinations}] ✗ {tiff_filename}: {error_msg}")
+                        failed_combinations.append((time_str, level_str, error_msg))
                 except Exception as e:
-                    logger.error(f"  ✗ Failed to process time={time_str}, level={level_str}: {e}")
+                    logger.error(f"  [{completed}/{total_combinations}] ✗ time={time_str}, level={level_str}: {e}")
                     failed_combinations.append((time_str, level_str, str(e)))
-                    continue
+
+        step2_timer.__exit__(None, None, None)
 
         # Log summary of failures
         if failed_combinations:
@@ -494,24 +573,26 @@ Examples:
 
             # Create ZIP file with all TIFF files
             logger.info(f"Creating ZIP archive: {output_zip}")
-            with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-                tiff_files = sorted([f for f in os.listdir(tiff_output_dir) if f.endswith('.tif')])
-                logger.info(f"Adding {len(tiff_files)} TIFF files to ZIP...")
+            with Timer("Step 3 - Create ZIP"):
+                with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    tiff_files = sorted([f for f in os.listdir(tiff_output_dir) if f.endswith('.tif')])
+                    logger.info(f"Adding {len(tiff_files)} TIFF files to ZIP...")
 
-                for tiff_file in tiff_files:
-                    tiff_path = os.path.join(tiff_output_dir, tiff_file)
-                    file_size = os.path.getsize(tiff_path)
-                    logger.info(f"  Adding {tiff_file} ({file_size / (1024*1024):.2f} MB)")
-                    zf.write(tiff_path, arcname=tiff_file)
+                    for tiff_file in tiff_files:
+                        tiff_path = os.path.join(tiff_output_dir, tiff_file)
+                        file_size = os.path.getsize(tiff_path)
+                        logger.info(f"  Adding {tiff_file} ({file_size / (1024*1024):.2f} MB)")
+                        zf.write(tiff_path, arcname=tiff_file)
 
             # Verify output ZIP
             logger.info(f"Verifying output ZIP file...")
-            with zipfile.ZipFile(output_zip, 'r') as zf:
-                files_in_zip = zf.namelist()
-                total_size = sum(zf.getinfo(f).file_size for f in files_in_zip)
-                logger.info(f"  ✓ ZIP contains {len(files_in_zip)} files")
-                logger.info(f"  ✓ Total uncompressed size: {total_size / (1024*1024):.2f} MB")
-                logger.info(f"  ✓ ZIP file size: {os.path.getsize(output_zip) / (1024*1024):.2f} MB")
+            with Timer("Step 3 - Verify ZIP"):
+                with zipfile.ZipFile(output_zip, 'r') as zf:
+                    files_in_zip = zf.namelist()
+                    total_size = sum(zf.getinfo(f).file_size for f in files_in_zip)
+                    logger.info(f"  ✓ ZIP contains {len(files_in_zip)} files")
+                    logger.info(f"  ✓ Total uncompressed size: {total_size / (1024*1024):.2f} MB")
+                    logger.info(f"  ✓ ZIP file size: {os.path.getsize(output_zip) / (1024*1024):.2f} MB")
 
         except Exception as e:
             logger.error(f"Failed to create output ZIP: {e}")
@@ -522,10 +603,12 @@ Examples:
         logger.info(f"Output ZIP: {output_zip}")
         logger.info("=" * 60)
 
+        overall_timer.__exit__(None, None, None)
         return 0
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
+        overall_timer.__exit__(None, None, None)
         return 1
 
     finally:
