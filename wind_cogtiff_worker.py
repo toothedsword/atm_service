@@ -619,6 +619,19 @@ Examples:
         time_list = u_header.get('timeList', [])
         level_list = u_header.get('levelList', [])
 
+        # Validate timeList and levelList consistency
+        u_time_list = u_header.get('timeList', [])
+        u_level_list = u_header.get('levelList', [])
+        v_time_list = v_header.get('timeList', [])
+        v_level_list = v_header.get('levelList', [])
+
+        if u_time_list != v_time_list:
+            logger.error(f"Mismatch: U10 timeList {u_time_list} vs V10 timeList {v_time_list}")
+            return 1
+        if u_level_list != v_level_list:
+            logger.error(f"Mismatch: U10 levelList {u_level_list} vs V10 levelList {v_level_list}")
+            return 1
+
         if not time_list or not level_list:
             logger.error("Missing timeList or levelList in header")
             return 1
