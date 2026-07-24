@@ -656,9 +656,9 @@ Examples:
         # Determine number of workers (quarter of available cores, for an
         # 8-core system this yields 2 workers). Using ThreadPoolExecutor
         # instead of ProcessPoolExecutor to avoid u/v array serialization
-        # overhead across process boundaries.
+        # overhead across process boundaries. Capped at 2 for memory safety.
         max_cores = os.cpu_count() or 1
-        num_workers = max(1, max_cores // 4)
+        num_workers = min(2, max(1, max_cores // 4))
         logger.info(f"Using {num_workers} parallel workers (out of {max_cores} cores)")
 
         # Create list of tasks
