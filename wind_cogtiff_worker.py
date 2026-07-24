@@ -224,14 +224,248 @@ def uv_to_wind(u: float, v: float) -> Tuple[float, float]:
 
 def save_wind_cogtiff(u_2d, v_2d, lon, lat, time_str, level_str, output_path):
     """
-    Calculate wind speed and direction, interpolate to target grid,
-    save as multi-channel COG TIFF.
+    计算风速/风向，插值到目标网格，保存为多通道 COG TIFF。
 
-    Band 1: wind_speed (int16, 0-255)
-    Band 2: wind_direction (int16, 0-360)
+    Band 1: wind_speed (int16, 0-255 m/s, 不缩放)
+    Band 2: wind_direction (int16, 0-360°, 气象学惯例：风的来向)
+
+    Parameters:
+    -----------
+    u_2d : np.ndarray
+        U 风分量 2D 数组 (ySize, xSize)
+    v_2d : np.ndarray
+        V 风分量 2D 数组 (ySize, xSize)
+    lon : np.ndarray
+        经度数组 (1D)
+    lat : np.ndarray
+        纬度数组 (1D)
+    time_str : str
+        时次标识符（来自 timeList）
+    level_str : str
+        层次标识符（来自 levelList）
+    output_path : str
+        输出 TIFF 文件路径
+
+    Returns:
+    --------
+    str
+        生成的 TIFF 文件路径
+
+    Raises:
+    -------
+    ValueError
+        插值或保存过程中的错误
     """
-    # TODO: Implement in Task 2
-    pass
+    logger.info(
+        f"Interpolating wind for time={time_str}, level={level_str}, "
+        f"shape={u_2d.shape}, output={output_path}"
+    )
+
+    # --- Validation ---
+    if u_2d.size == 0 or v_2d.size == 0:
+        raise ValueError("u_2d/v_2d is empty")
+    if u_2d.shape != v_2d.shape:
+        raise ValueError(f"u_2d and v_2d shape mismatch: {u_2d.shape} vs {v_2d.shape}")
+    if len(lon) < 2 or len(lat) < 2:
+        raise ValueError("lon and lat must have at least 2 elements")
+
+    # Sort coordinates (RegularGridInterpolator requires increasing order)
+    if lon[0] > lon[-1]:
+        lon = lon[::-1]
+        u_2d = u_2d[:, ::-1]
+        v_2d = v_2d[:, ::-1]
+    if lat[0] > lat[-1]:
+        lat = lat[::-1]
+        u_2d = u_2d[::-1, :]
+        v_2d = v_2d[::-1, :]
+
+    logger.info(
+        f"Original data: lon range [{lon.min():.4f}, {lon.max():.4f}], "
+        f"lat range [{lat.min():.4f}, {lat.max():.4f}]"
+    )
+
+    # --- Create interpolators (one for u, one for v) ---
+    with Timer(f"    create_interpolator[{level_str}]"):
+        u_interpolator = RegularGridInterpolator(
+            (lat, lon),  # (y, x) order for 2D array
+            u_2d,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan
+        )
+        v_interpolator = RegularGridInterpolator(
+            (lat, lon),
+            v_2d,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan
+        )
+
+    # --- Define target grid with 0.002° resolution ---
+    target_resolution = 0.002
+    # Output bounds (hardcoded): lon 105-111°, lat 28-33°
+    lon_min, lon_max = 105.0, 111.0
+    lat_min, lat_max = 28.0, 33.0
+
+    target_lon = np.arange(lon_min, lon_max + target_resolution, target_resolution)
+    target_lat = np.arange(lat_min, lat_max + target_resolution, target_resolution)
+
+    logger.info(
+        f"Target grid: lon {len(target_lon)} points, lat {len(target_lat)} points, "
+        f"total {len(target_lon) * len(target_lat)} pixels"
+    )
+
+    # --- Interpolate u and v to target grid ---
+    with Timer(f"    meshgrid_and_interpolate[{level_str}]"):
+        lon_grid, lat_grid = np.meshgrid(target_lon, target_lat)
+        points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=-1)
+
+        u_interp = u_interpolator(points).reshape(lat_grid.shape)
+        v_interp = v_interpolator(points).reshape(lat_grid.shape)
+
+    logger.info(f"Interpolated u/v shape: {u_interp.shape}")
+
+    # --- Vectorized wind speed / direction calculation ---
+    wind_speed = np.sqrt(u_interp ** 2 + v_interp ** 2)
+
+    # atan2(-u, -v) gives the direction the wind is coming FROM (meteorological)
+    wind_direction = np.degrees(np.arctan2(-u_interp, -v_interp))
+    wind_direction = np.where(wind_direction < 0, wind_direction + 360.0, wind_direction)
+
+    # Calm wind (speed below threshold) -> direction defined as 0, matching uv_to_wind()
+    calm_mask = wind_speed < 1e-8
+    wind_direction = np.where(calm_mask, 0.0, wind_direction)
+
+    logger.info(
+        f"Wind speed range: [{np.nanmin(wind_speed):.2f}, {np.nanmax(wind_speed):.2f}], "
+        f"direction range: [{np.nanmin(wind_direction):.2f}, {np.nanmax(wind_direction):.2f}]"
+    )
+
+    # --- Convert to int16 with nodata handling ---
+    nodata_value = -9999
+
+    valid_mask = ~(np.isnan(u_interp) | np.isnan(v_interp))
+
+    speed_int16 = np.full(wind_speed.shape, nodata_value, dtype=np.int16)
+    direction_int16 = np.full(wind_direction.shape, nodata_value, dtype=np.int16)
+
+    # Wind speed: clip to 0-255, no scaling, direct truncation
+    clipped_speed = np.clip(wind_speed[valid_mask], 0, 255)
+    speed_int16[valid_mask] = clipped_speed.astype(np.int16)
+
+    # Wind direction: clip to 0-360
+    clipped_direction = np.clip(wind_direction[valid_mask], 0, 360)
+    direction_int16[valid_mask] = clipped_direction.astype(np.int16)
+
+    logger.info(
+        f"Converted to int16: speed dtype={speed_int16.dtype}, "
+        f"direction dtype={direction_int16.dtype}"
+    )
+
+    # --- Create output directory if needed ---
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # --- Calculate geotransform ---
+    transform = from_bounds(
+        lon_min, lat_min,
+        lon_max + target_resolution, lat_max + target_resolution,
+        speed_int16.shape[1], speed_int16.shape[0]
+    )
+
+    # --- Write multi-channel GeoTIFF with COG settings ---
+    try:
+        with Timer(f"    write_geotiff[{level_str}]"):
+            with rasterio.open(
+                output_path,
+                'w',
+                driver='GTiff',
+                height=speed_int16.shape[0],
+                width=speed_int16.shape[1],
+                count=2,
+                dtype=np.int16,
+                crs='EPSG:4326',
+                transform=transform,
+                nodata=nodata_value,
+                compress='deflate',
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                BIGTIFF='NO',
+                PREDICTOR=2
+            ) as dst:
+                dst.write(speed_int16, 1)
+                dst.write(direction_int16, 2)
+
+                dst.update_tags(1, description=f'wind_speed (m/s, 0-255) t={time_str} level={level_str}')
+                dst.update_tags(2, description=f'wind_direction (deg, 0-360, meteorological) t={time_str} level={level_str}')
+
+                if valid_mask.any():
+                    dst.update_tags(
+                        1,
+                        STATISTICS_MINIMUM=str(speed_int16[valid_mask].min()),
+                        STATISTICS_MAXIMUM=str(speed_int16[valid_mask].max()),
+                        STATISTICS_MEAN=str(speed_int16[valid_mask].mean()),
+                        STATISTICS_STDDEV=str(speed_int16[valid_mask].std()),
+                    )
+                    dst.update_tags(
+                        2,
+                        STATISTICS_MINIMUM=str(direction_int16[valid_mask].min()),
+                        STATISTICS_MAXIMUM=str(direction_int16[valid_mask].max()),
+                        STATISTICS_MEAN=str(direction_int16[valid_mask].mean()),
+                        STATISTICS_STDDEV=str(direction_int16[valid_mask].std()),
+                    )
+    except Exception as e:
+        raise ValueError(f"Failed to write GeoTIFF: {str(e)}") from e
+
+    logger.info(f"GeoTIFF written: {output_path}")
+
+    # --- Build COG pyramids using gdaladdo ---
+    try:
+        gdal_cmd = [
+            'gdaladdo',
+            '-r', 'average',
+            output_path,
+            '2', '4', '8', '16', '32'
+        ]
+
+        logger.info(f"Building pyramids: {' '.join(gdal_cmd)}")
+        with Timer(f"    gdaladdo[{level_str}]"):
+            subprocess.run(gdal_cmd, check=True, capture_output=True, text=True)
+        logger.info("Pyramids built successfully")
+
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"gdaladdo failed: {e.stderr}. Continuing without pyramids.")
+    except FileNotFoundError:
+        logger.warning("gdaladdo not found. Continuing without pyramids.")
+
+    # --- Verify output file ---
+    if not os.path.exists(output_path):
+        raise ValueError(f"Output file not created: {output_path}")
+
+    file_size = os.path.getsize(output_path)
+    logger.info(f"Output file created: {output_path}, size: {file_size} bytes")
+
+    try:
+        with rasterio.open(output_path) as src:
+            logger.info(
+                f"Verified with rasterio: "
+                f"shape=({src.height}, {src.width}), "
+                f"dtype={src.dtypes[0]}, "
+                f"crs={src.crs}, "
+                f"nodata={src.nodata}, "
+                f"count={src.count}"
+            )
+            if src.count != 2:
+                raise ValueError(f"Expected 2 bands, got {src.count}")
+    except Exception as e:
+        raise ValueError(f"Failed to verify GeoTIFF: {str(e)}") from e
+
+    # --- Memory cleanup ---
+    gc.collect()
+
+    return output_path
 
 
 def main():
