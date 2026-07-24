@@ -5,12 +5,13 @@ run.py - 主服务入口
 负责接收请求、解析参数、调度子进程执行计算，自身不加载重型库，长期运行不会内存溢出。
 
 Worker脚本:
-  converter_worker.py  -- 数据格式转换 (txt/json/surface/height/time -> zip)
-  plot_worker.py       -- 激光雷达PPI绘图
-  slice_worker.py      -- 航迹剖面图绘制
-  ec_worker.py         -- EC GRIB2 二维字段提取
-  ec_point_worker.py   -- EC GRIB2 点值时间序列提取
-  cache.py             -- Open-Meteo 5×5格点后台缓存
+  converter_worker.py      -- 数据格式转换 (txt/json/surface/height/time -> zip)
+  plot_worker.py           -- 激光雷达PPI绘图
+  slice_worker.py          -- 航迹剖面图绘制
+  ec_worker.py             -- EC GRIB2 二维字段提取
+  ec_point_worker.py       -- EC GRIB2 点值时间序列提取
+  wind_cogtiff_worker.py   -- 风速/风向 COG TIFF 生成
+  cache.py                 -- Open-Meteo 5×5格点后台缓存
 
 启动: python3 run.py
 端口: 5001
@@ -1863,7 +1864,7 @@ def wind_cogtiff():
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({"success": False, "error": "文件过大，最大支持100MB"}), 413
+    return jsonify({"success": False, "error": "文件过大，最大支持500MB (MAX_CONTENT_LENGTH exceeded)"}), 413
 
 @app.errorhandler(404)
 def not_found(e):
