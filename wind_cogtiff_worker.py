@@ -395,8 +395,8 @@ def save_wind_cogtiff(u_2d, v_2d, lon, lat, time_str, level_str, output_path):
                 BIGTIFF='NO',
                 PREDICTOR=2
             ) as dst:
-                dst.write(speed_int16, 1)
-                dst.write(direction_int16, 2)
+                dst.write(speed_int16[::-1, :], 1)     # Band 1 (flipped north-up)
+                dst.write(direction_int16[::-1, :], 2)  # Band 2 (flipped north-up)
 
                 dst.update_tags(1, description=f'wind_speed (m/s, 0-255) t={time_str} level={level_str}')
                 dst.update_tags(2, description=f'wind_direction (deg, 0-360, meteorological) t={time_str} level={level_str}')
