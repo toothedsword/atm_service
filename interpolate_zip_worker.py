@@ -341,7 +341,7 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
                 BIGTIFF='NO',
                 PREDICTOR=2
             ) as dst:
-                dst.write(interpolated_int16, 1)
+                dst.write(interpolated_int16[::-1, :], 1)
                 # Add description and write statistics
                 dst.update_tags(1, description=f'{level_str} (×10, divide by 10 to get original value)')
                 dst.update_tags(1, STATISTICS_MINIMUM=str(interpolated_int16[valid_mask].min()),
