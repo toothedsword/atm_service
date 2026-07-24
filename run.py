@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Flask应用
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 app.config['JSON_AS_ASCII'] = False
 
 ALLOWED_EXTENSIONS = {'txt', 'json'}
@@ -207,12 +207,13 @@ def get_service_info():
             "/api/ppi_vad_latest": "激光雷达PPI最新完整圈 VAD反演风场 PNG+TIF -> ZIP",
             "/api/wrf_slice":      "WRF模式数据剖面图（温湿/风切/垂直速度/云水）-> PNG或ZIP",
             "/api/interpolate-zip-to-cogtiff": "WRF/气象数据 ZIP → COG TIFF（多时次多层次插值）",
+            "/api/wind-cogtiff":     "WRF U10/V10 风分量 ZIP → 风速/风向 COG TIFF（多通道）",
         },
         "workers": ["converter_worker.py", "plot_worker.py", "slice_worker.py",
                     "ec_worker.py", "ec_point_worker.py", "cache.py",
                     "ppi_worker.py", "ppi_vad_worker.py", "wrf_slice_worker.py",
                     "interpolate_zip_worker.py"],
-        "max_file_size": "100MB",
+        "max_file_size": "500MB",
     })
 
 
@@ -1699,7 +1700,7 @@ def interpolate_zip_to_cogtiff():
             '--output', output_file
         ]
 
-        rc, stdout, stderr = run_worker(cmd, timeout=3600)  # 1小时超时
+        rc, stdout, stderr = run_worker(cmd, timeout=7200)  # 1小时超时
 
         if rc != 0:
             return jsonify({
@@ -1738,6 +1739,120 @@ def interpolate_zip_to_cogtiff():
         # 延迟清理临时文件
         if input_file:
             cleanup_later(input_file)
+        if output_file:
+            cleanup_later(output_file)
+
+
+@app.route('/api/wind-cogtiff', methods=['POST'])
+def wind_cogtiff():
+    """
+    将 WRF U10/V10 风分量 ZIP 计算为 风速/风向 COG TIFF。
+
+    输入：
+    - u_file: U10 风分量 ZIP 文件（multipart/form-data 上传）
+    - v_file: V10 风分量 ZIP 文件（multipart/form-data 上传）
+      - 两个 ZIP 内均应包含 data.bin（包含多时次多层次数据）
+
+    输出：
+    - application/zip：结果 ZIP 文件，内含所有生成的多通道（风速/风向）GeoTIFF 文件
+      - 文件命名：wind_{time}_{level}.tif
+
+    示例：
+    ```
+    curl -X POST \\
+      -F "u_file=@u10.zip" \\
+      -F "v_file=@v10.zip" \\
+      http://localhost:5001/api/wind-cogtiff \\
+      -o result.zip
+    ```
+    """
+    task_id = str(uuid.uuid4())
+    u_input_file = None
+    v_input_file = None
+    output_file = None
+
+    try:
+        # 检查文件上传
+        if 'u_file' not in request.files:
+            return jsonify({"success": False, "error": "未提供 u_file 文件"}), 400
+        if 'v_file' not in request.files:
+            return jsonify({"success": False, "error": "未提供 v_file 文件"}), 400
+
+        u_file = request.files['u_file']
+        v_file = request.files['v_file']
+
+        if not u_file.filename:
+            return jsonify({"success": False, "error": "u_file 文件名为空"}), 400
+        if not v_file.filename:
+            return jsonify({"success": False, "error": "v_file 文件名为空"}), 400
+
+        # 检查文件扩展名
+        if not u_file.filename.lower().endswith('.zip'):
+            return jsonify({"success": False, "error": "u_file 只接受 .zip 格式文件"}), 400
+        if not v_file.filename.lower().endswith('.zip'):
+            return jsonify({"success": False, "error": "v_file 只接受 .zip 格式文件"}), 400
+
+        # 保存上传文件
+        u_input_file = os.path.join(TEMP_BASE, f'{task_id}_u_input.zip')
+        v_input_file = os.path.join(TEMP_BASE, f'{task_id}_v_input.zip')
+        u_file.save(u_input_file)
+        v_file.save(v_input_file)
+        logger.info(f"已保存上传文件: {u_input_file}, {v_input_file}")
+
+        # 准备输出文件
+        output_file = os.path.join(TEMP_BASE, f'{task_id}_output.zip')
+
+        # 调用 worker 子进程
+        cmd = [
+            'python3',
+            os.path.join(SERVICE_DIR, 'wind_cogtiff_worker.py'),
+            '--u-input', u_input_file,
+            '--v-input', v_input_file,
+            '--output', output_file
+        ]
+
+        rc, stdout, stderr = run_worker(cmd, timeout=7200)  # 2小时超时
+
+        if rc != 0:
+            return jsonify({
+                "success": False,
+                "error": f"风场处理失败: {stderr}"
+            }), 500
+
+        if not os.path.exists(output_file):
+            return jsonify({
+                "success": False,
+                "error": "未生成输出文件"
+            }), 500
+
+        # 返回结果文件
+        u_basename = os.path.splitext(secure_filename(u_file.filename))[0]
+        v_basename = os.path.splitext(secure_filename(v_file.filename))[0]
+        response = send_file(
+            output_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'wind_cogtiff_{u_basename}_{v_basename}.zip'
+        )
+
+        logger.info(f"✓ 风场处理完成: {output_file}")
+        return response
+
+    except Exception as e:
+        logger.error(f"wind-cogtiff 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": f"服务错误: {str(e)}"
+        }), 500
+
+    finally:
+        # 延迟清理临时文件
+        if u_input_file:
+            cleanup_later(u_input_file)
+        if v_input_file:
+            cleanup_later(v_input_file)
         if output_file:
             cleanup_later(output_file)
 
