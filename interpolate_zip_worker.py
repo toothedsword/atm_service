@@ -273,8 +273,9 @@ def interpolate_and_save_tif(data_2d, lon, lat, time_str, level_str, output_path
 
     # Define target grid with 0.002° resolution
     target_resolution = 0.002
-    lon_min, lon_max = lon.min(), lon.max()
-    lat_min, lat_max = lat.min(), lat.max()
+    # Output bounds (hardcoded): lon 105-111°, lat 28-33°
+    lon_min, lon_max = 105.0, 111.0
+    lat_min, lat_max = 28.0, 33.0
 
     # Create target grid
     target_lon = np.arange(lon_min, lon_max + target_resolution, target_resolution)
@@ -508,7 +509,7 @@ Examples:
         # Each worker allocates ~500MB+ during meshgrid/interpolate phase
         # Using ThreadPoolExecutor instead of ProcessPoolExecutor to avoid data serialization overhead
         max_cores = os.cpu_count() or 1
-        num_workers = max(1, max_cores // 4)
+        num_workers = max(1, max_cores // 8)
         logger.info(f"Using {num_workers} parallel workers (out of {max_cores} cores)")
 
         # Create list of tasks
